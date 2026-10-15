@@ -1,4 +1,4 @@
-# VIsion-Agent-Harness
+# Vision-Agent-Harness
 
 An evaluation guide for building a CPU-only vision agent on a Raspberry Pi, using `llama.cpp` where the selected model and its vision components are supported.
 
