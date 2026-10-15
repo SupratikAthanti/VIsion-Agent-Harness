@@ -18,9 +18,23 @@ pip install huggingface_hub
 huggingface-cli download ggml-org/SmolVLM-256M-Instruct-GGUF --local-dir models/
 ```
 
-## 3. Run Inference with `llama.cpp`
-Once you have `llama.cpp` built and your model weights ready, you can run inference pointing to your image in the `images/` folder:
+## 3. Run the Interactive CLI (v0.1)
+
+Activate your virtual environment and start the CLI:
 ```bash
-llama-minicpmv-cli -m models/smolvlm-256m-instruct.gguf --mmproj models/mmproj-smolvlm-256m-instruct.gguf --image images/test.jpg -p "Describe this image in one sentence."
+source venv/bin/activate
+python3 vision_cli.py
 ```
-*(Note: Exact binary names and flags depend on your specific model architecture and `llama.cpp` version).*
+
+- Drop any screenshot or image into the `images/` folder (e.g. `images/screenshot.png`).
+- By default, it automatically picks the first image alphabetically.
+- Type any question directly at the prompt:
+  ```
+  [screenshot.png] > Describe the layout of this web page
+  ```
+- Helpful CLI commands:
+  - `/reload` : Re-scans `images/` after you drop in a new screenshot
+  - `/list` : Lists all images currently in `images/`
+  - `/select <filename>` : Switches active image
+  - `/exit` : Exits the CLI
+
