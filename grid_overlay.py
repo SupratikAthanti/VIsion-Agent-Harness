@@ -130,7 +130,7 @@ def draw_target_marker(
     draw.line([(px, py - box_radius - 10), (px, py + box_radius + 10)], fill=(255, 0, 60, 200), width=2)
 
     # Text banner
-    banner_text = f"🎯 {label} ({px}px, {py}px | {x_ratio*100:.1f}%, {y_ratio*100:.1f}%)"
+    banner_text = f"{label} ({px}px, {py}px | {x_ratio*100:.1f}%, {y_ratio*100:.1f}%)"
     try:
         font = ImageFont.load_default()
     except Exception:

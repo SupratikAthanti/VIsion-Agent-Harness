@@ -138,6 +138,8 @@ def find_text_element(image_path: Path, search_text: str, resize_max: int = 800)
     each wider width in RETRY_WIDTHS. Returns None if not found, otherwise a dict
     with `text`, `center_x`, `center_y` (0.0-1.0), `center_pct` (0-100),
     `bbox_px` and `conf` (lowest word confidence in the match).
+    
+    Also applies heuristic rules for common UI patterns.
     """
     tokens = [t for t in (_normalize(p) for p in search_text.split()) if t]
     if not tokens:
@@ -148,6 +150,15 @@ def find_text_element(image_path: Path, search_text: str, resize_max: int = 800)
         words = extract_text_with_coordinates(image_path, resize_max=width)
         match = _match_phrase(words, tokens)
         if match:
+            # Get image size for heuristics
+            with Image.open(image_path) as img:
+                img_size = img.size
+            
+            # Apply heuristics to potentially adjust the result
+            search_phrase = extract_search_phrase(search_text)
+            heuristic_result = apply_heuristics(search_phrase, match, words, img_size)
+            if heuristic_result:
+                return heuristic_result
             return match
     return None
 
@@ -172,3 +183,93 @@ def extract_search_phrase(query: str) -> str:
             break
         phrase = new
     return _TRAILING.sub("", phrase).strip()
+
+
+def apply_heuristics(
+    search_phrase: str,
+    ocr_result: Optional[Dict],
+    all_words: List[Dict],
+    image_size: tuple
+) -> Optional[Dict]:
+    """
+    Apply heuristic rules to adjust OCR results for common UI patterns.
+    
+    Returns a modified result dict if a heuristic applies, None otherwise.
+    """
+    if not ocr_result:
+        return None
+    
+    img_w, img_h = image_size
+    phrase_lower = search_phrase.lower()
+    
+    # Rule: New tab - look for + icon to the right of "New Tab" text
+    if "new tab" in phrase_lower:
+        # Find words to the right of the New Tab text
+        text_x = ocr_result["center_x"]
+        text_y = ocr_result["center_y"]
+        
+        # Look for symbols or small text nearby (within 10% horizontal)
+        for word in all_words:
+            word_x, word_y = word["center"]
+            # Check if word is to the right and on same line
+            if (word_x > text_x and 
+                word_x - text_x < 0.15 and  # Within 15% to the right
+                abs(word_y - text_y) < 0.05):  # Same line (within 5%)
+                # Check if it looks like a plus sign or small element
+                word_text = word["text"].strip()
+                if word_text in ["+", "＋", "add", "new"] or len(word_text) <= 2:
+                    # Return the icon coordinates instead
+                    return {
+                        "text": f"+ (new tab icon)",
+                        "center_x": word_x,
+                        "center_y": word_y,
+                        "center_pct": (word_x * 100, word_y * 100),
+                        "bbox_px": word["bbox_px"],
+                        "conf": ocr_result["conf"],
+                    }
+    
+    # Rule: Close tab - look for X icon near tab text
+    if "close" in phrase_lower and "tab" in phrase_lower:
+        text_x = ocr_result["center_x"]
+        text_y = ocr_result["center_y"]
+        
+        # Look for X to the right of the tab label
+        for word in all_words:
+            word_x, word_y = word["center"]
+            if (word_x > text_x and 
+                word_x - text_x < 0.10 and
+                abs(word_y - text_y) < 0.05):
+                word_text = word["text"].strip()
+                if word_text.lower() in ["x", "×", "close", "✕"]:
+                    return {
+                        "text": f"X (close tab icon)",
+                        "center_x": word_x,
+                        "center_y": word_y,
+                        "center_pct": (word_x * 100, word_y * 100),
+                        "bbox_px": word["bbox_px"],
+                        "conf": ocr_result["conf"],
+                    }
+    
+    # Rule: Menu button - look for hamburger icon or menu text
+    if "menu" in phrase_lower:
+        text_x = ocr_result["center_x"]
+        text_y = ocr_result["center_y"]
+        
+        # Look for hamburger icon (three lines symbol often OCR'd as ||| or similar)
+        for word in all_words:
+            word_x, word_y = word["center"]
+            if (abs(word_x - text_x) < 0.10 and
+                abs(word_y - text_y) < 0.05):
+                word_text = word["text"].strip()
+                if word_text in ["≡", "|||", "☰", "menu", "⋮"]:
+                    return {
+                        "text": f"Menu icon",
+                        "center_x": word_x,
+                        "center_y": word_y,
+                        "center_pct": (word_x * 100, word_y * 100),
+                        "bbox_px": word["bbox_px"],
+                        "conf": ocr_result["conf"],
+                    }
+    
+    # No heuristic applied, return original result
+    return None

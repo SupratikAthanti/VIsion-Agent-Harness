@@ -8,13 +8,14 @@ Includes Coordinate Grid Overlays and Visual Target Box verification.
 import os
 import sys
 import time
+import threading
 import shutil
 import json
 import base64
 import argparse
 import urllib.request
 from pathlib import Path
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict
 
 # Try to import Pillow for grid operations
 try:
@@ -104,7 +105,7 @@ def image_to_base64(image_path: Path, max_dimension: int = 1920) -> Tuple[str, s
     and return (mime_type, base64_str).
     """
     mime = detect_image_mime(image_path) or "image/png"
-    
+
     # If Pillow is available, ensure we don't blow up memory on 4K+ retina images
     if HAS_PIL:
         try:
@@ -128,8 +129,43 @@ def image_to_base64(image_path: Path, max_dimension: int = 1920) -> Tuple[str, s
     return mime, b64
 
 
-def query_ollama_moondream(image_path: Path, prompt: str, timeout: int = 120) -> Tuple[str, float]:
-    """Query local Moondream model via Ollama REST API."""
+class Spinner:
+    """Animated status line shown while a blocking call runs (only in a real terminal)."""
+
+    FRAMES = "|/-\\"
+
+    def __init__(self, message: str):
+        self.message = message
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._spin, daemon=True)
+        self._t0 = 0.0
+
+    def _spin(self) -> None:
+        i = 0
+        while not self._stop.wait(0.1):
+            elapsed = time.time() - self._t0
+            frame = self.FRAMES[i % len(self.FRAMES)]
+            sys.stdout.write(f"\r{frame} {self.message} {elapsed:.1f}s")
+            sys.stdout.flush()
+            i += 1
+
+    def __enter__(self) -> "Spinner":
+        self._t0 = time.time()
+        if sys.stdout.isatty():
+            self._thread.start()
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        if self._thread.is_alive():
+            self._stop.set()
+            self._thread.join()
+            sys.stdout.write("\r" + " " * 79 + "\r")
+            sys.stdout.flush()
+        return False
+
+
+def query_ollama_moondream(image_path: Path, prompt: str, timeout: int = 120) -> Tuple[str, Dict[str, float]]:
+    """Query local Moondream model via Ollama REST API. Returns (answer, timing stats)."""
     _, b64_img = image_to_base64(image_path)
     url = "http://127.0.0.1:11434/api/generate"
     payload = json.dumps({
@@ -148,7 +184,15 @@ def query_ollama_moondream(image_path: Path, prompt: str, timeout: int = 120) ->
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         data = json.loads(resp.read().decode("utf-8"))
     elapsed = time.time() - t0
-    return data.get("response", "").strip(), elapsed
+    ns = 1e9  # Ollama reports durations in nanoseconds
+    stats = {
+        "total": elapsed,
+        "load": data.get("load_duration", 0) / ns,  # >0 only when the model had to be loaded
+        "prompt": data.get("prompt_eval_duration", 0) / ns,
+        "generate": data.get("eval_duration", 0) / ns,
+        "tokens": data.get("eval_count", 0),
+    }
+    return data.get("response", "").strip(), stats
 
 
 def format_bytes(size: int) -> str:
@@ -160,42 +204,44 @@ def format_bytes(size: int) -> str:
     return f"{size:.1f} TB"
 
 
-def run_hybrid_query(query: str, image_path: Path) -> None:
+def run_hybrid_query(query: str, image_path: Path, first_run: bool = False) -> None:
     """Route a request via TEV1, then run OCR with graceful fallbacks, and print the result."""
     try:
-        route = route_task(query)
+        with Spinner("Loading TEV1 router..." if first_run else "Routing request..."):
+            route = route_task(query)
         method = route["method"]
-        print(f"🧭 TEV1 route: {method} (confidence {route['confidence'] * 100:.1f}%)")
+        print(f"TEV1 route: {method} (confidence {route['confidence'] * 100:.1f}%)")
     except TEV1Error as e:
-        print(f"⚠️  TEV1 routing failed ({e}); defaulting to OCR.")
+        print(f"Warning: TEV1 routing failed ({e}); defaulting to OCR.")
         method = "ocr"
 
     if method == "vision":
-        print("ℹ️  Vision answers are not wired into hybrid mode yet.")
+        print("Note: Vision answers are not wired into hybrid mode yet.")
         print("   Ask about a visible label instead, e.g. 'Where is the <label> button?'")
         return
 
     if method == "yolo":
-        print("ℹ️  YOLO icon detection is not wired in yet; falling back to OCR.")
+        print("Note: YOLO icon detection is not wired in yet; falling back to OCR.")
 
     phrase = extract_search_phrase(query)
     if not phrase:
-        print("⚠️  Could not find a label to search for in that request.")
+        print("Warning: Could not find a label to search for in that request.")
         return
 
     try:
-        hit = find_text_element(image_path, phrase)
+        with Spinner("Running OCR..."):
+            hit = find_text_element(image_path, phrase)
     except OCRError as e:
         print(f"[Error] OCR failed: {e}")
         return
 
     if hit is None:
-        print(f"❌ OCR could not find '{phrase}' on screen.")
+        print(f"OCR could not find '{phrase}' on screen.")
         print("   YOLO fallback is not available yet. Use /grid to inspect the screen manually.")
         return
 
     x_pct, y_pct = hit["center_pct"]
-    print(f"\n🎯 Found '{hit['text']}' (OCR confidence {hit['conf']:.0f}%)")
+    print(f"\nFound '{hit['text']}' (OCR confidence {hit['conf']:.0f}%)")
     print(f"   Would click at ({x_pct:.1f}%, {y_pct:.1f}%)")
     print(f"   Verify with: /mark {hit['center_x']:.3f} {hit['center_y']:.3f} {hit['text']}\n")
 
@@ -240,14 +286,13 @@ def main():
 
     base_image = selected_image  # Keep reference to original clean image
     grid_active = False
+    model_used = False  # Becomes True after the first inference query
 
     # 2. Setup backend
     print("=" * 65)
-    print("  👁️  Vision Agent Harness CLI (v0.2)")
+    print("  Vision Agent Harness CLI (v0.2)")
     print("=" * 65)
     print(f" • Backend:     {args.backend.upper()}")
-    print(f" • Memory:      Capped (< 1.5 GB RAM)")
-    print(f" • Grid Engine: {'Available (Pillow)' if HAS_PIL else 'Not Available'}")
 
     llm = None
     if args.backend == "llamacpp":
@@ -265,16 +310,16 @@ def main():
             print(f"[Error] GGUF model files not found in {models_dir}.")
             sys.exit(1)
 
-        print("\n⏳ Initializing llama-cpp-python vision engine...")
+        print("\nInitializing llama-cpp-python vision engine...")
         t0 = time.time()
         chat_handler = MTMDChatHandler(clip_model_path=str(mmproj_path), verbose=False, use_gpu=False)
         llm = Llama(model_path=str(model_path), chat_handler=chat_handler, n_ctx=2048, n_threads=args.threads, verbose=False)
-        print(f"✅ Model loaded in {time.time() - t0:.2f}s!")
+        print(f"Model loaded in {time.time() - t0:.2f}s!")
     elif args.backend == "hybrid":
         if not HAS_HYBRID:
             print("[Error] ocr_engine / tev1_router could not be imported.")
             sys.exit(1)
-        print(" • Model:       Hybrid (Tesseract OCR + TEV1 router - Ollama localhost:11434)")
+        print(" • Model:       Hybrid (Tesseract OCR + TEV1 router - Ollama localhost:11434, TEV1 loads on first message)")
         if not shutil.which("tesseract"):
             print("[Error] tesseract not found. Install with: sudo apt install tesseract-ocr")
             sys.exit(1)
@@ -283,9 +328,9 @@ def main():
         except TEV1Error as e:
             print(f"[Error] TEV1 healthcheck failed: {e}")
             sys.exit(1)
-        print(f"✅ TEV1 router ready ({tev1_name}); OCR ready.")
+        print(f"TEV1 router ready ({tev1_name}); OCR ready.")
     else:
-        print(" • Model:       Moondream2 (1.8B INT4 - Ollama localhost:11434)")
+        print(" • Model:       Moondream2 (1.8B INT4 - Ollama localhost:11434, loads on first message)")
         # Quick healthcheck
         try:
             with urllib.request.urlopen("http://127.0.0.1:11434/api/tags", timeout=5) as r:
@@ -293,7 +338,7 @@ def main():
         except Exception as e:
             print(f"[Error] Ollama service not reachable on 127.0.0.1:11434: {e}")
             sys.exit(1)
-        print("✅ Moondream backend connected and ready!")
+        print("Moondream backend connected and ready!")
 
     def print_image_status():
         nonlocal selected_image
@@ -307,9 +352,9 @@ def main():
                 except Exception:
                     pass
             grid_indicator = " (GRID OVERLAY ACTIVE)" if grid_active else ""
-            print(f"\n🖼️  Active Image: [{selected_image.name}]{dim_str} ({size_str}){grid_indicator}")
+            print(f"\nActive Image: [{selected_image.name}]{dim_str} ({size_str}){grid_indicator}")
         else:
-            print("\n⚠️  No image currently found in 'images/' folder.")
+            print("\nWarning: No image currently found in 'images/' folder.")
             print("   Drop an image into 'images/' and run '/reload'.")
 
     print_image_status()
@@ -355,7 +400,7 @@ def main():
             else:
                 print(f"Base images in '{images_dir.name}/':")
                 for idx, img in enumerate(imgs, 1):
-                    prefix = "👉" if selected_image and img.name == selected_image.name else "  "
+                    prefix = ">" if selected_image and img.name == selected_image.name else " "
                     print(f" {prefix} {idx}. {img.name} ({format_bytes(img.stat().st_size)})")
             continue
 
@@ -386,7 +431,7 @@ def main():
             create_coordinate_grid(base_image, grid_file)
             selected_image = grid_file
             grid_active = True
-            print(f"✅ Grid overlay generated and active: {grid_file.name}")
+            print(f"Grid overlay generated and active: {grid_file.name}")
             print(f"   You can open '{grid_file}' to see the labeled cells (Cols {column_label(0)}-{column_label(GRID_COLS - 1)}, Rows R1-R{GRID_ROWS})!")
             print_image_status()
             continue
@@ -395,7 +440,7 @@ def main():
             if base_image and base_image.exists():
                 selected_image = base_image
                 grid_active = False
-                print("✅ Reverted to original image.")
+                print("Reverted to original image.")
                 print_image_status()
             continue
 
@@ -421,7 +466,7 @@ def main():
                 src = base_image if base_image else selected_image
                 out_target = images_dir / f"target_{src.name}.png"
                 draw_target_marker(src, x_val, y_val, out_target, label=marker_label)
-                print(f"\n🎯 Target marked at ({x_val*100:.1f}%, {y_val*100:.1f}%)!")
+                print(f"\nTarget marked at ({x_val*100:.1f}%, {y_val*100:.1f}%)!")
                 print(f"   Saved preview to: {out_target}")
                 print("   Open this file in your IDE to verify if the box hits the button!\n")
             except ValueError as ve:
@@ -434,10 +479,11 @@ def main():
 
         # Inference query
         if not selected_image or not selected_image.exists():
-            print("❌ Cannot query: No image loaded. Drop an image into 'images/' and type '/reload'.")
+            print("[Error] Cannot query: No image loaded. Drop an image into 'images/' and type '/reload'.")
             continue
 
-        print("\n🤔 Thinking...", flush=True)
+        first_run = not model_used
+        model_used = True
 
         if args.backend == "moondream":
             try:
@@ -448,15 +494,27 @@ def main():
                         f"This image has an overlaid coordinate grid with Columns {column_label(0)}-{column_label(GRID_COLS - 1)} and Rows R1-R{GRID_ROWS}. "
                         f"{user_input} State the grid cell (e.g. J1) or percentage coordinate if applicable."
                     )
-                answer, elapsed = query_ollama_moondream(selected_image, effective_prompt)
-                print(f"\n💬 Moondream:\n{answer}\n")
-                print(f"⏱️  [{elapsed:.2f}s]\n")
+                with Spinner("Loading model..." if first_run else "Thinking..."):
+                    answer, stats = query_ollama_moondream(selected_image, effective_prompt)
+                if stats["load"] >= 1.0:  # Ollama reports tiny nonzero loads for an already-loaded model
+                    print(f"\nModel loaded (took {stats['load']:.2f}s)")
+                print(f"\nMoondream:\n{answer}\n")
+                tokens, gen = stats["tokens"], stats["generate"]
+                rate = f", {tokens / gen:.1f} tok/s" if tokens > 1 and gen >= 0.1 else ""
+                parts = []
+                if stats["load"] >= 1.0:
+                    parts.append(f"load {stats['load']:.2f}s")
+                parts.append(f"prompt {stats['prompt']:.2f}s")
+                parts.append(f"generated {tokens} tokens in {gen:.2f}s{rate}")
+                print(f"Response took {stats['total']:.2f}s ({', '.join(parts)})\n")
             except Exception as e:
                 print(f"\n[Error during Moondream inference]: {e}\n")
 
         elif args.backend == "hybrid":
             try:
-                run_hybrid_query(user_input, base_image or selected_image)
+                t0 = time.time()
+                run_hybrid_query(user_input, base_image or selected_image, first_run=first_run)
+                print(f"Response took {time.time() - t0:.2f}s\n")
             except Exception as e:
                 print(f"\n[Error during hybrid query]: {e}\n")
 
@@ -466,23 +524,25 @@ def main():
                 mime, b64_img = image_to_base64(selected_image)
                 data_uri = f"data:{mime};base64,{b64_img}"
                 t0 = time.time()
-                response = llm.create_chat_completion(
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "image_url", "image_url": {"url": data_uri}},
-                                {"type": "text", "text": user_input},
-                            ],
-                        }
-                    ],
-                    max_tokens=256,
-                    temperature=0.2,
-                )
+                with Spinner("Loading model..." if first_run else "Thinking..."):
+                    response = llm.create_chat_completion(
+                        messages=[
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "image_url", "image_url": {"url": data_uri}},
+                                    {"type": "text", "text": user_input},
+                                ],
+                            }
+                        ],
+                        max_tokens=256,
+                        temperature=0.2,
+                    )
                 elapsed = time.time() - t0
                 answer = response["choices"][0]["message"]["content"]
-                print(f"\n💬 SmolVLM:\n{answer.strip()}\n")
-                print(f"⏱️  [{elapsed:.2f}s]\n")
+                tokens = response.get("usage", {}).get("completion_tokens", 0)
+                print(f"\nSmolVLM:\n{answer.strip()}\n")
+                print(f"Response took {elapsed:.2f}s (generated {tokens} tokens)\n")
             except Exception as e:
                 print(f"\n[Error during SmolVLM inference]: {e}\n")
 
