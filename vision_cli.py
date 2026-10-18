@@ -30,12 +30,19 @@ except ImportError:
 
 # Hybrid backend: Tesseract OCR + TEV1 routing
 try:
-    from ocr_engine import find_text_element, extract_search_phrase, OCRError
+    from ocr_engine import find_text_element, extract_search_phrase, extract_text_with_coordinates, OCRError
     from tev1_router import route_task, check_tev1_available, TEV1Error
     from yolo_detector import YOLODetector
     HAS_HYBRID = True
 except ImportError:
     HAS_HYBRID = False
+
+# AT-SPI is optional; the adapter handles missing bindings and inactive buses.
+try:
+    import atspi_bridge
+    HAS_ATSPI = True
+except ImportError:
+    HAS_ATSPI = False
 
 # Trained UI templates (/annotate, /teach, template-first queries)
 try:
@@ -70,7 +77,139 @@ except ImportError:
     HAS_ACTIONS = False
 
 TEMPLATE_THRESHOLD = 0.8   # minimum OpenCV match confidence for a trained template
+YOLO_CONFIDENCE_THRESHOLD = 0.5  # reject weak icon detections before reporting or acting
 ANNOTATE_TIMEOUT = 600    # seconds to wait for the browser before giving up
+
+
+def _normalized_match_text(value: str) -> str:
+    """Normalize a label for matching regardless of spaces or punctuation."""
+    return "".join(character for character in (value or "").casefold() if character.isalnum())
+
+
+def _atspi_location(name: str, image_path: Path) -> Optional[Dict]:
+    """Resolve an accessible named element to image-relative coordinates, when possible."""
+    if not HAS_ATSPI or not name:
+        return None
+    try:
+        element = atspi_bridge.find_element_by_name(name)
+        role = _normalized_match_text(element.get("role", "")) if element else ""
+        actionable_roles = ("button", "menuitem", "link", "tab", "pushbutton", "togglebutton")
+        if not element or not any(actionable in role for actionable in actionable_roles):
+            return None
+        bounds = element.get("bounds")
+        if not bounds:
+            return None
+        with Image.open(image_path) as image:
+            width, height = image.size
+        x, y, element_width, element_height = bounds
+        if width <= 0 or height <= 0 or element_width <= 0 or element_height <= 0:
+            return None
+        center_x, center_y = x + element_width / 2, y + element_height / 2
+        if not (0 <= center_x < width and 0 <= center_y < height):
+            return None
+        return {
+            "x_pct": center_x / width,
+            "y_pct": center_y / height,
+            "confidence": 0.99,
+            "source": "atspi",
+            "label": element.get("name") or name,
+            "ref": element.get("ref"),
+        }
+    except Exception as e:
+        print(f"   [AT-SPI] unavailable for this query: {e}")
+        return None
+
+
+def _reliable_yolo_detection(detection: Optional[Dict], image_path: Path) -> bool:
+    """Reject low-confidence or screen-container YOLO boxes before using their centres."""
+    if not detection:
+        return False
+    confidence = float(detection.get("confidence", 0.0))
+    if confidence < YOLO_CONFIDENCE_THRESHOLD:
+        print(f"YOLO detection confidence too low ({confidence * 100:.0f}%), skipping")
+        return False
+    bbox = detection.get("bbox") or detection
+    box_width = bbox.get("width")
+    box_height = bbox.get("height")
+    if box_width is not None and box_height is not None:
+        try:
+            with Image.open(image_path) as image:
+                image_width, image_height = image.size
+            if box_width > 0.3 * image_width and box_height > 0.1 * image_height:
+                print("YOLO detection is too large to be a reliable icon, skipping")
+                return False
+        except (OSError, ValueError):
+            pass
+    return True
+
+
+def _ocr_symbol_candidate(image_path: Path, target: str, kind: Optional[str] = None) -> Optional[Dict]:
+    """Use nearby OCR-recognized glyphs instead of clicking a label for an icon request."""
+    text = (target or "").casefold()
+    is_icon = kind == "icon" or "icon" in text
+    if "new tab" in text and (is_icon or text.strip() == "new tab"):
+        reference_text, symbols, horizontal_limit, region = "new tab", {"+", "＋"}, 0.15, None
+    elif "close" in text:
+        reference_text, symbols, horizontal_limit, region = "close", {"x", "×", "✕", "✖"}, 0.1, lambda x, y: y <= 0.15 and x >= 0.5
+    elif "menu" in text:
+        reference_text, symbols, horizontal_limit, region = "menu", {"≡", "☰", "|||", "⋮"}, 0.1, lambda x, y: y <= 0.15 and x <= 0.3
+    elif "search" in text and is_icon:
+        reference_text, symbols, horizontal_limit, region = "search", {"🔍", "⌕"}, 0.15, None
+    else:
+        return None
+
+    try:
+        words = extract_text_with_coordinates(image_path, resize_max=1600)
+    except OCRError:
+        return None
+    normalized_ref = _normalized_match_text(reference_text)
+    ref_words = [word for word in words if normalized_ref and normalized_ref in _normalized_match_text(word["text"])]
+    if reference_text == "new tab" and not ref_words:
+        new_words = [word for word in words if _normalized_match_text(word["text"]) in {"new", "tab"}]
+        ref_words = new_words if len(new_words) >= 2 else []
+        if not ref_words:
+            return None
+    if ref_words:
+        ref_x = sum(word["center"][0] for word in ref_words) / len(ref_words)
+        ref_y = sum(word["center"][1] for word in ref_words) / len(ref_words)
+    else:
+        ref_x = ref_y = None
+
+    candidates = []
+    for word in words:
+        symbol = word["text"].strip().casefold()
+        x, y = word["center"]
+        if symbol not in symbols:
+            continue
+        if region and not region(x, y):
+            continue
+        if ref_x is not None and (abs(x - ref_x) >= horizontal_limit or abs(y - ref_y) >= 0.05):
+            continue
+        if reference_text == "new tab" and x <= ref_x:
+            continue
+        candidates.append(word)
+    if not candidates:
+        return None
+    if ref_x is not None:
+        candidate = min(candidates, key=lambda word: (
+            abs(word["center"][0] - ref_x) + abs(word["center"][1] - ref_y)
+        ))
+    elif reference_text == "close":
+        candidate = max(candidates, key=lambda word: word["center"][0])
+    else:
+        anchor_x, anchor_y = (0.03, 0.04) if reference_text == "menu" else (0.5, 0.08)
+        candidate = min(candidates, key=lambda word: (
+            abs(word["center"][0] - anchor_x) + abs(word["center"][1] - anchor_y)
+        ))
+    x, y = candidate["center"]
+    return {
+        "x_pct": x, "y_pct": y, "confidence": candidate["conf"] / 100,
+        "source": "ocr", "label": candidate["text"],
+    }
+
+
+def _suggest_annotation() -> None:
+    print("   Use /annotate or /teach to train unknown elements.")
 
 
 def detect_image_mime(file_path: Path) -> Optional[str]:
@@ -339,10 +478,23 @@ def run_annotate_session(image_path: Path) -> None:
 
 
 def find_trained_template(query: str, names: List[str]) -> Optional[str]:
-    """Return the trained template named in the query's search phrase (longest name wins), if any."""
-    phrase = normalize_name(extract_search_phrase(query))
-    hits = [n for n in names if f" {n} " in f" {phrase} "]
-    return max(hits, key=len) if hits else None
+    """Return the longest template label contained in a query, ignoring spaces and punctuation."""
+    phrase = _normalized_match_text(extract_search_phrase(query))
+    compact_query = _normalized_match_text(query)
+    hits = []
+    for name in names:
+        normalized_name = _normalized_match_text(name)
+        if not normalized_name:
+            continue
+        # The extracted target may omit a generic kind ("new tab" for "new tab icon").
+        query_tokens = [token for token in re.findall(r"[a-z0-9]+", query.casefold())
+                        if token not in {"please", "click", "tap", "press", "hit", "select", "find", "locate",
+                                         "where", "is", "are", "the", "a", "an", "button", "icon", "link", "tab", "menu"}]
+        name_tokens = [token for token in re.findall(r"[a-z0-9]+", name.casefold())
+                       if token not in {"button", "icon", "link", "tab", "menu"}]
+        if normalized_name in compact_query or (name_tokens and all(token in query_tokens for token in name_tokens)) or (len(phrase) >= 4 and phrase in normalized_name):
+            hits.append(name)
+    return max(hits, key=lambda name: len(_normalized_match_text(name))) if hits else None
 
 
 def run_template_query(query: str, image_path: Path, images_dir: Path) -> bool:
@@ -378,8 +530,25 @@ def run_template_query(query: str, image_path: Path, images_dir: Path) -> bool:
 
 
 def run_hybrid_query(query: str, image_path: Path, images_dir: Path, first_run: bool = False) -> None:
-    """Route a request via TEV1, then run OCR with graceful fallbacks, and print the result."""
+    """Try accessibility and trained templates first, then route to OCR/YOLO."""
+    target_name = extract_search_phrase(query)
+    # Icon requests should not resolve to a nearby text label through accessibility.
+    icon_request = bool(re.search(r"\bicon\b", query, re.IGNORECASE))
+    accessible = None if icon_request else _atspi_location(target_name, image_path)
+    if accessible:
+        x_pct, y_pct = accessible["x_pct"], accessible["y_pct"]
+        print(f"Found '{accessible['label']}' via atspi")
+        print(f"   Would click at ({x_pct * 100:.1f}%, {y_pct * 100:.1f}%)")
+        auto_mark_target(image_path, images_dir, x_pct, y_pct, accessible["label"])
+        return
     if run_template_query(query, image_path, images_dir):
+        return
+    symbol = _ocr_symbol_candidate(image_path, query)
+    if symbol:
+        x_pct, y_pct = symbol["x_pct"], symbol["y_pct"]
+        print(f"\nFound '{symbol['label']}' via spatial OCR")
+        print(f"   Would click at ({x_pct * 100:.1f}%, {y_pct * 100:.1f}%)")
+        auto_mark_target(image_path, images_dir, x_pct, y_pct, symbol["label"])
         return
 
     try:
@@ -391,6 +560,10 @@ def run_hybrid_query(query: str, image_path: Path, images_dir: Path, first_run: 
         print(f"Warning: TEV1 routing failed ({e}); defaulting to OCR.")
         method = "ocr"
 
+    if re.search(r"\bicon\b", query, re.IGNORECASE):
+        # If spatial OCR didn't find an icon glyph, do not substitute a text-label click.
+        method = "yolo"
+
     if method == "vision":
         print("Note: Vision answers are not wired into hybrid mode yet.")
         print("   Ask about a visible label instead, e.g. 'Where is the <label> button?'")
@@ -400,58 +573,33 @@ def run_hybrid_query(query: str, image_path: Path, images_dir: Path, first_run: 
         try:
             with Spinner("Running YOLO icon detection..."):
                 detector = YOLODetector()
-                
-                # For new tab icon, try to find text first, then look for nearby icon
-                if 'new tab' in query.lower():
-                    # First try OCR to find "New Tab" text
-                    phrase = extract_search_phrase(query) or "New Tab"
-                    text_hit = find_text_element(image_path, phrase)
-                    
-                    if text_hit:
-                        # Look for small icon near the text
-                        icon_detection = detector.find_icon_near_text(
-                            str(image_path), 
-                            text_hit, 
-                            icon_type='plus'
-                        )
-                        if icon_detection and icon_detection['confidence'] > 0.05:
-                            x_pct, y_pct = icon_detection['center_pct']['x'], icon_detection['center_pct']['y']
-                            print(f"\nFound icon near '{text_hit['text']}' (YOLO confidence {icon_detection['confidence']*100:.0f}%)")
-                            print(f"   Would click at ({x_pct:.1f}%, {y_pct:.1f}%)")
-                            auto_mark_target(image_path, images_dir, x_pct/100, y_pct/100, f"{text_hit['text']} icon")
-                            return
-                        else:
-                            # Text-based icon detection failed, try position-based
-                            print(f"Text-based icon detection failed, trying position-based...")
-                            detection = detector.find_icon_by_position(str(image_path), icon_type='top_bar')
-                            if detection and detection['confidence'] > 0.05:
-                                x_pct, y_pct = detection['center_pct']['x'], detection['center_pct']['y']
-                                print(f"\nFound icon (YOLO confidence {detection['confidence']*100:.0f}%)")
-                                print(f"   Would click at ({x_pct:.1f}%, {y_pct:.1f}%)")
-                                auto_mark_target(image_path, images_dir, x_pct/100, y_pct/100, "icon")
-                                return
-                
-                # Fallback to position-based detection
-                icon_type = 'top_bar'
-                if 'close' in query.lower():
-                    icon_type = 'top_bar'
-                elif 'menu' in query.lower():
-                    icon_type = 'top_left'
-                
+                lowered_query = query.casefold()
+                icon_type = "top_left" if "menu" in lowered_query else "top_bar"
                 detection = detector.find_icon_by_position(str(image_path), icon_type=icon_type)
-            
-            if detection is None:
-                print("YOLO found no matching icons in the image.")
-                print("   Falling back to OCR...")
-                method = "ocr"
-            else:
-                x_pct, y_pct = detection['center_pct']['x'], detection['center_pct']['y']
-                print(f"\nFound icon (YOLO confidence {detection['confidence']*100:.0f}%)")
+
+            if detection is not None:
+                if not _reliable_yolo_detection(detection, image_path):
+                    print("   No reliable match found.")
+                    _suggest_annotation()
+                    return
+                x_pct, y_pct = detection["center_pct"]["x"], detection["center_pct"]["y"]
+                print(f"\nFound icon (YOLO confidence {detection['confidence'] * 100:.0f}%)")
                 print(f"   Would click at ({x_pct:.1f}%, {y_pct:.1f}%)")
-                auto_mark_target(image_path, images_dir, x_pct/100, y_pct/100, "icon")
+                auto_mark_target(image_path, images_dir, x_pct / 100, y_pct / 100, "icon")
                 return
+            print("YOLO found no matching icons in the image.")
+            if icon_request:
+                print("   No reliable match found.")
+                _suggest_annotation()
+                return
+            print("   Falling back to OCR...")
+            method = "ocr"
         except Exception as e:
             print(f"YOLO detection failed: {e}")
+            if icon_request:
+                print("   No reliable match found.")
+                _suggest_annotation()
+                return
             print("   Falling back to OCR...")
             method = "ocr"
 
@@ -476,14 +624,7 @@ def run_hybrid_query(query: str, image_path: Path, images_dir: Path, first_run: 
                 detector = YOLODetector()
                 
                 # Determine icon type based on query
-                icon_type = 'top_bar'
-                if 'new tab' in query.lower():
-                    icon_type = 'top_bar'
-                elif 'close' in query.lower():
-                    icon_type = 'top_bar'
-                elif 'menu' in query.lower():
-                    icon_type = 'top_left'
-                
+                icon_type = "top_left" if "menu" in query.lower() else "top_bar"
                 detection = detector.find_icon_by_position(str(image_path), icon_type=icon_type)
             
             if detection is None:
@@ -491,7 +632,11 @@ def run_hybrid_query(query: str, image_path: Path, images_dir: Path, first_run: 
                 print("   Use /grid to inspect the screen manually.")
                 return
             else:
-                x_pct, y_pct = detection['center_pct']['x'], detection['center_pct']['y']
+                if not _reliable_yolo_detection(detection, image_path):
+                    print("   No reliable match found.")
+                    _suggest_annotation()
+                    return
+                x_pct, y_pct = detection["center_pct"]["x"], detection["center_pct"]["y"]
                 print(f"\nFound icon via YOLO fallback (confidence {detection['confidence']*100:.0f}%)")
                 print(f"   Would click at ({x_pct:.1f}%, {y_pct:.1f}%)")
                 auto_mark_target(image_path, images_dir, x_pct/100, y_pct/100, "icon")
@@ -515,6 +660,7 @@ LIVE_DIR = Path(__file__).resolve().parent / ".cache"  # gitignored scratch spac
 CLICK_EFFECT_THRESHOLD = 1.0  # mean grey-level change that counts as "the click did something"
 PIPELINE_BUDGET = 2.0         # seconds; target response time for common actions
 _yolo_instance = None
+_yolo_rejected_unreliable = False
 
 
 def _safe(fn, label: str):
@@ -547,7 +693,7 @@ def _ocr_candidates(image: Path, target: str) -> List[Dict]:
 
 
 def _yolo_candidate(image: Path, target: str) -> Optional[Dict]:
-    global _yolo_instance
+    global _yolo_instance, _yolo_rejected_unreliable
     model = Path(__file__).resolve().parent / "models" / "onnx" / "model.onnx"
     if not HAS_HYBRID or not model.exists():
         return None
@@ -556,7 +702,10 @@ def _yolo_candidate(image: Path, target: str) -> Optional[Dict]:
     if _yolo_instance is None:
         _yolo_instance = YOLODetector(str(model))
     detection = _yolo_instance.find_icon_by_position(str(image), icon_type=icon_type)
-    if not detection or detection["confidence"] <= 0.05:
+    if detection and not _reliable_yolo_detection(detection, image):
+        _yolo_rejected_unreliable = True
+        return None
+    if not detection:
         return None
     return {
         "x_pct": detection["center_pct"]["x"] / 100, "y_pct": detection["center_pct"]["y"] / 100,
@@ -580,11 +729,16 @@ def _heuristic_candidate(image: Path, target: str, ref: Optional[Dict]) -> Optio
     return None
 
 
-def locate_target(target: str, image: Path, ref: Optional[Dict] = None) -> Tuple[List[Dict], Optional[str]]:
+def locate_target(target: str, image: Path, ref: Optional[Dict] = None,
+                  kind: Optional[str] = None) -> Tuple[List[Dict], Optional[str]]:
     """
     Find a target on screen. Layers, in order: trained template, OCR, YOLO, layout heuristics,
     then the last known location from context memory. Returns (candidates, source).
     """
+    accessible = _atspi_location(target, image)
+    if accessible and not (kind == "icon" or "icon" in target.casefold()):
+        return [accessible], "atspi"
+
     if HAS_TEMPLATES:
         names = list_templates()
         name = find_trained_template(target, names) if names else None
@@ -595,12 +749,21 @@ def locate_target(target: str, image: Path, ref: Optional[Dict] = None) -> Tuple
                 return [{"x_pct": match["x_pct"], "y_pct": match["y_pct"],
                          "confidence": match["confidence"], "source": "template", "label": name}], "template"
 
-    cands = _safe(lambda: _ocr_candidates(image, target), "OCR")
-    if cands:
-        return cands, "ocr"
+    symbol = _safe(lambda: _ocr_symbol_candidate(image, target, kind), "spatial OCR")
+    if symbol:
+        return [symbol], "ocr"
+    # Icon-only requests must not degrade to clicking a neighboring text label.
+    if kind != "icon":
+        cands = _safe(lambda: _ocr_candidates(image, target), "OCR")
+        if cands:
+            return cands, "ocr"
+    global _yolo_rejected_unreliable
+    _yolo_rejected_unreliable = False
     cand = _safe(lambda: _yolo_candidate(image, target), "YOLO")
     if cand:
         return [cand], "yolo"
+    if _yolo_rejected_unreliable or kind == "icon":
+        return [], None
     cand = _safe(lambda: _heuristic_candidate(image, target, ref), "heuristic")
     if cand:
         return [cand], "heuristic"
@@ -762,8 +925,12 @@ def _run_step(intent: Dict, image: Optional[Path], images_dir: Path, execute: bo
         return False
 
     ref = _last_location()
-    cands, source = locate_target(target, image, ref)
+    cands, source = locate_target(target, image, ref, kind=params.get("kind"))
     if not cands:
+        if _yolo_rejected_unreliable:
+            print("   No reliable match found.")
+            _suggest_annotation()
+            return False
         print(f"   Could not find '{target}' on screen (OCR, YOLO, heuristics all failed).")
         print("   Use /annotate to train it, or /grid to inspect the screen.")
         return False
@@ -820,7 +987,7 @@ def _run_step(intent: Dict, image: Optional[Path], images_dir: Path, execute: bo
     return True
 
 
-def run_action_pipeline(intent: Dict, base_image: Optional[Path], execute: bool, learn: bool) -> bool:
+def run_action_pipeline(intent: Dict, base_image: Optional[Path], images_dir: Path, execute: bool, learn: bool) -> bool:
     """
     Run a classified request. With execute=False this is a dry run: it locates targets in
     `base_image` and reports them without moving the mouse or typing.
@@ -839,7 +1006,7 @@ def run_action_pipeline(intent: Dict, base_image: Optional[Path], execute: bool,
             if image is None:
                 print("[Error] Could not capture the screen; nothing was done.")
                 return False
-        ok = _run_step(step, image, execute, learn, interactive)
+        ok = _run_step(step, image, images_dir, execute, learn, interactive)
         if not ok:
             print("Stopped: that step failed.")
             break
@@ -1259,7 +1426,7 @@ def main():
                 target_image = base_image if base_image else selected_image
                 intent = classify_intent(user_input) if HAS_ACTIONS else None
                 if intent is not None and intent["action"] != "UNKNOWN":
-                    run_action_pipeline(intent, target_image, execute_mode, learn_mode)
+                    run_action_pipeline(intent, target_image, images_dir, execute_mode, learn_mode)
                 else:
                     run_hybrid_query(user_input, target_image, images_dir, first_run=first_run)
                 print(f"Response took {time.time() - t0:.2f}s\n")

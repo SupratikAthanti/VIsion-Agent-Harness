@@ -351,9 +351,9 @@ class YOLODetector:
         if not filtered:
             return None
         
-        # Sort by size (smaller first) then confidence
-        # This prefers actual buttons over large UI elements
-        filtered.sort(key=lambda d: (d['bbox']['width'] * d['bbox']['height'], -d['confidence']))
+        # Prefer stronger detections first; use size to break ties between similarly
+        # confident icons so a weak tiny box cannot outrank a reliable button.
+        filtered.sort(key=lambda d: (-d['confidence'], d['bbox']['width'] * d['bbox']['height']))
         return filtered[0]
     
     def find_icon_near_text(self, image_path: str, text_location: Dict, 

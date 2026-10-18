@@ -31,7 +31,7 @@ _STEP_SPLIT = re.compile(
 )
 _AND_SPLIT = re.compile(r"\s+and\s+", re.IGNORECASE)
 _ACTION_VERB = re.compile(
-    r"^(?:please\s+)?(?:click|tap|press|hit|select|type|enter|write|input|go|open|"
+    r"^(?:please\s+)?(?:click|tap|press|hit|select|mark|type|enter|write|input|go|open|"
     r"scroll|wait|drag|find|locate|navigate|visit)\b",
     re.IGNORECASE,
 )
@@ -51,7 +51,7 @@ _TYPE_BARE = re.compile(r"^(?:please\s+)?(?:type|enter|write|input)$", re.IGNORE
 _TYPE_QUOTED = re.compile(r"""^(["'])(.+?)\1(?:\s+(?:in|into|on)\s+(.+))?$""")
 _TYPE_IN = re.compile(r"^(.+?)\s+(?:in|into|on)\s+(.+)$", re.IGNORECASE)
 _CLICK = re.compile(
-    r"^(?:please\s+)?(where\s+is|where\s+are|where's|click|tap|press|hit|select|push|"
+    r"^(?:please\s+)?(where\s+is|where\s+are|where's|click|tap|press|hit|select|mark|push|"
     r"find|locate|choose|open|go\s+to)\s*(?:on\s+)?(.*)$",
     re.IGNORECASE,
 )
