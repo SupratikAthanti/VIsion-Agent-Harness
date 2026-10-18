@@ -307,12 +307,18 @@ class YOLODetector:
         image = Image.open(image_path)
         img_w, img_h = image.size
         
-        # Filter detections based on expected position
+        # Filter detections based on expected position AND size
+        # Prefer smaller icons (buttons) over large UI elements (address bars, menus)
         filtered = []
         for det in detections:
             center_x = det['bbox']['x'] + det['bbox']['width'] / 2
             center_y = det['bbox']['y'] + det['bbox']['height'] / 2
             size = det['bbox']['width'] * det['bbox']['height']
+            
+            # Skip very large detections (likely UI containers, not icons)
+            # Max icon size: 200x200 pixels (40000 sq pixels)
+            if size > 40000:
+                continue
             
             if icon_type == 'top_left':
                 # Top-left corner (back, menu, etc.)
@@ -331,7 +337,7 @@ class YOLODetector:
                 if size < 10000:  # Less than 100x100 pixels
                     filtered.append(det)
             else:
-                # Return all
+                # Return all (but still filter by size)
                 filtered.append(det)
         
         if not filtered:
@@ -345,8 +351,10 @@ class YOLODetector:
         if not filtered:
             return None
         
-        # Return highest confidence detection
-        return max(filtered, key=lambda d: d['confidence'])
+        # Sort by size (smaller first) then confidence
+        # This prefers actual buttons over large UI elements
+        filtered.sort(key=lambda d: (d['bbox']['width'] * d['bbox']['height'], -d['confidence']))
+        return filtered[0]
     
     def find_icon_near_text(self, image_path: str, text_location: Dict, 
                           icon_type: str = 'plus') -> Dict:

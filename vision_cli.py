@@ -11,9 +11,12 @@ import time
 import threading
 import shutil
 import json
+import math
+import re
 import base64
 import argparse
 import urllib.request
+import webbrowser
 from pathlib import Path
 from typing import Optional, List, Tuple, Dict
 
@@ -33,6 +36,41 @@ try:
     HAS_HYBRID = True
 except ImportError:
     HAS_HYBRID = False
+
+# Trained UI templates (/annotate, /teach, template-first queries)
+try:
+    from template_manager import (
+        save_template, load_template, list_templates, delete_template,
+        get_template_info, normalize_name, validate_name,
+    )
+    from template_matcher import find_template
+    HAS_TEMPLATES = True
+except ImportError:
+    HAS_TEMPLATES = False
+
+# Browser annotation tool (needs fastapi + uvicorn)
+try:
+    from annotation_server import AnnotationServer
+    HAS_ANNOTATE = True
+except ImportError:
+    HAS_ANNOTATE = False
+
+# Intent -> locate -> act modules (optional; the rest of the CLI works without them)
+try:
+    from intent_classifier import classify_intent
+    from layout_heuristics import (
+        predict_search_box_location, predict_submit_button_location,
+        predict_navigation_location, predict_close_button_location, predict_menu_button_location,
+    )
+    from ocr_engine import find_all_text_elements
+    import context_memory
+    import action_executor
+    HAS_ACTIONS = True
+except ImportError:
+    HAS_ACTIONS = False
+
+TEMPLATE_THRESHOLD = 0.8   # minimum OpenCV match confidence for a trained template
+ANNOTATE_TIMEOUT = 600    # seconds to wait for the browser before giving up
 
 
 def detect_image_mime(file_path: Path) -> Optional[str]:
@@ -224,8 +262,126 @@ def auto_mark_target(image_path: Path, images_dir: Path, x_pct: float, y_pct: fl
         print(f"   [Error] Failed to mark target: {e}\n")
 
 
+def confirm_overwrite(name: str) -> bool:
+    """Return True if the template may be written: it is new, or the user confirmed the overwrite."""
+    if load_template(name) is None:
+        return True
+    try:
+        answer = input(f"Template '{name}' already exists. Overwrite? (y/n) ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    return answer in ("y", "yes")
+
+
+def print_template_saved(name: str, rel_path: str, x_pct: float, y_pct: float) -> None:
+    info = get_template_info(name) or {}
+    size = info.get("crop_size", "?")
+    print(f"✓ Saved template: {rel_path}")
+    print("✓ Saved metadata: trained_ui/button_locations.json")
+    print(f"   Template saved from ({x_pct*100:.1f}%, {y_pct*100:.1f}%) - crop size: {size}x{size}px")
+
+
+def run_annotate_session(image_path: Path) -> None:
+    """Serve the annotation UI, wait for the browser to save or cancel, and handle the result here."""
+    server = AnnotationServer(image_path)
+    try:
+        server.start()
+    except RuntimeError as e:
+        print(f"[Error] {e}")
+        return
+
+    url = server.url
+    print(f"Opening annotation tool at {url}...")
+    print(f"   Image: {image_path.name}  (Ctrl+C to cancel)")
+    try:
+        if not webbrowser.open(url):
+            print(f"   Could not open a browser automatically. Open this URL manually: {url}")
+    except Exception as e:
+        print(f"   Browser preview failed ({e}). Open this URL manually: {url}")
+
+    keep_running = False  # True once a template is saved; the server then shuts itself down
+    try:
+        deadline = time.time() + ANNOTATE_TIMEOUT
+        while time.time() < deadline:
+            sub = server.next_submission(timeout=0.5)
+            if sub is None:
+                continue
+            if sub.kind == "cancel":
+                print("Annotation cancelled.\n")
+                break
+            if not confirm_overwrite(sub.name):
+                sub.respond({
+                    "status": "declined",
+                    "message": f"Not saved: '{sub.name}' already exists. Choose another name or click Cancel.",
+                })
+                print(f"Overwrite of '{sub.name}' declined. Waiting for another submission...")
+                continue
+            try:
+                rel = save_template(image_path, sub.name, sub.x_pct, sub.y_pct, sub.crop_size)
+            except (ValueError, OSError) as e:
+                sub.respond({"status": "error", "message": f"Save failed: {e}"})
+                print(f"[Error] Failed to save template: {e}")
+                continue
+            sub.respond({"status": "success", "template_path": rel, "message": "Template saved successfully"})
+            print_template_saved(sub.name, rel, sub.x_pct, sub.y_pct)
+            print()
+            keep_running = True
+            server.schedule_stop(5.0)
+            break
+        else:
+            print("Timed out waiting for the browser. Annotation cancelled.\n")
+    except KeyboardInterrupt:
+        print("\nAnnotation cancelled.\n")
+    finally:
+        if not keep_running:
+            server.stop()
+
+
+def find_trained_template(query: str, names: List[str]) -> Optional[str]:
+    """Return the trained template named in the query's search phrase (longest name wins), if any."""
+    phrase = normalize_name(extract_search_phrase(query))
+    hits = [n for n in names if f" {n} " in f" {phrase} "]
+    return max(hits, key=len) if hits else None
+
+
+def run_template_query(query: str, image_path: Path, images_dir: Path) -> bool:
+    """
+    Try trained templates first. Returns True if a template matched and was printed;
+    False means the caller should fall through to OCR / YOLO.
+    """
+    if not HAS_TEMPLATES:
+        return False
+    names = list_templates()
+    name = find_trained_template(query, names) if names else None
+    if name is None:
+        return False
+
+    print(f"Checking trained templates... Found \"{name}\"")
+    template_path = load_template(name)
+    if template_path is None:
+        print(f"   Template file for '{name}' is missing; skipping.")
+        return False
+
+    with Spinner(f"Matching '{name}' template..."):
+        match = find_template(image_path, template_path, threshold=TEMPLATE_THRESHOLD)
+    if match is None:
+        print(f"   No confident match for '{name}' (threshold {TEMPLATE_THRESHOLD*100:.0f}%).")
+        print("   Falling back to OCR / YOLO...")
+        return False
+
+    x_pct, y_pct = match["x_pct"] * 100, match["y_pct"] * 100
+    print(f"\nFound '{name}' with {match['confidence']*100:.0f}% confidence (template match)")
+    print(f"   Would click at ({x_pct:.1f}%, {y_pct:.1f}%)")
+    auto_mark_target(image_path, images_dir, match["x_pct"], match["y_pct"], name)
+    return True
+
+
 def run_hybrid_query(query: str, image_path: Path, images_dir: Path, first_run: bool = False) -> None:
     """Route a request via TEV1, then run OCR with graceful fallbacks, and print the result."""
+    if run_template_query(query, image_path, images_dir):
+        return
+
     try:
         with Spinner("Loading TEV1 router..." if first_run else "Routing request..."):
             route = route_task(query)
@@ -351,6 +507,364 @@ def run_hybrid_query(query: str, image_path: Path, images_dir: Path, first_run: 
     auto_mark_target(image_path, images_dir, hit['center_x'], hit['center_y'], hit['text'])
 
 
+# ---------------------------------------------------------------------------
+# Action pipeline: classify -> locate (template, OCR, YOLO, heuristics) -> act
+# ---------------------------------------------------------------------------
+
+LIVE_DIR = Path(__file__).resolve().parent / ".cache"  # gitignored scratch space for live screenshots
+CLICK_EFFECT_THRESHOLD = 1.0  # mean grey-level change that counts as "the click did something"
+PIPELINE_BUDGET = 2.0         # seconds; target response time for common actions
+_yolo_instance = None
+
+
+def _safe(fn, label: str):
+    """Run one detection layer. A failing layer is reported and skipped, never fatal."""
+    try:
+        return fn()
+    except Exception as e:
+        print(f"   [{label}] failed: {e}")
+        return None
+
+
+def _capture_live(name: str) -> Optional[Path]:
+    path = LIVE_DIR / name
+    return path if action_executor.capture_screen(path) else None
+
+
+def _ocr_candidates(image: Path, target: str) -> List[Dict]:
+    variants = [target]
+    stripped = re.sub(r"\s+(menu|box|field|bar|button|icon|tab|link)$", "", target, flags=re.IGNORECASE).strip()
+    if stripped and stripped != target:
+        variants.append(stripped)
+    for phrase in variants:
+        hits = find_all_text_elements(image, phrase)
+        if hits:
+            return [{
+                "x_pct": h["center_x"], "y_pct": h["center_y"],
+                "confidence": h["conf"] / 100, "source": "ocr", "label": h["text"],
+            } for h in hits]
+    return []
+
+
+def _yolo_candidate(image: Path, target: str) -> Optional[Dict]:
+    global _yolo_instance
+    model = Path(__file__).resolve().parent / "models" / "onnx" / "model.onnx"
+    if not HAS_HYBRID or not model.exists():
+        return None
+    t = target.lower()
+    icon_type = "top_left" if "menu" in t else "top_right" if "close" in t else "top_bar"
+    if _yolo_instance is None:
+        _yolo_instance = YOLODetector(str(model))
+    detection = _yolo_instance.find_icon_by_position(str(image), icon_type=icon_type)
+    if not detection or detection["confidence"] <= 0.05:
+        return None
+    return {
+        "x_pct": detection["center_pct"]["x"] / 100, "y_pct": detection["center_pct"]["y"] / 100,
+        "confidence": detection["confidence"], "source": "yolo", "label": target,
+    }
+
+
+def _heuristic_candidate(image: Path, target: str, ref: Optional[Dict]) -> Optional[Dict]:
+    t = target.lower()
+    anchor = ref or {"x_pct": 0.5, "y_pct": 0.5}
+    if "close" in t:
+        return predict_close_button_location(image)
+    if "menu" in t:
+        return predict_menu_button_location(image)
+    if re.search(r"submit|send|login|log in|sign in|\bok\b|continue|save|\bgo\b", t):
+        return predict_submit_button_location(image, anchor)
+    if "search" in t:
+        return predict_search_box_location(image)
+    if re.search(r"\b(home|back|forward|settings|file|edit|view|help|tools)\b", t):
+        return predict_navigation_location(image, "top_bar")
+    return None
+
+
+def locate_target(target: str, image: Path, ref: Optional[Dict] = None) -> Tuple[List[Dict], Optional[str]]:
+    """
+    Find a target on screen. Layers, in order: trained template, OCR, YOLO, layout heuristics,
+    then the last known location from context memory. Returns (candidates, source).
+    """
+    if HAS_TEMPLATES:
+        names = list_templates()
+        name = find_trained_template(target, names) if names else None
+        if name:
+            template = load_template(name)
+            match = find_template(image, template, threshold=TEMPLATE_THRESHOLD) if template else None
+            if match:
+                return [{"x_pct": match["x_pct"], "y_pct": match["y_pct"],
+                         "confidence": match["confidence"], "source": "template", "label": name}], "template"
+
+    cands = _safe(lambda: _ocr_candidates(image, target), "OCR")
+    if cands:
+        return cands, "ocr"
+    cand = _safe(lambda: _yolo_candidate(image, target), "YOLO")
+    if cand:
+        return [cand], "yolo"
+    cand = _safe(lambda: _heuristic_candidate(image, target, ref), "heuristic")
+    if cand:
+        return [cand], "heuristic"
+    known = context_memory.get_known_location(target)
+    if known:
+        return [{"x_pct": known[0], "y_pct": known[1], "confidence": 0.5,
+                 "source": "context", "label": target}], "context"
+    return [], None
+
+
+def _last_location() -> Optional[Dict]:
+    """Position of the most recent successful action; used as the reference for spatial reasoning."""
+    for action in reversed(context_memory.get_recent_actions(10)):
+        if action.get("location"):
+            x, y = action["location"]
+            return {"x_pct": x, "y_pct": y}
+    return None
+
+
+def _choose_candidate(cands: List[Dict], ref: Optional[Dict], execute: bool, interactive: bool) -> Optional[Dict]:
+    """Pick one of several matches: nearest to the last action, else ask the user, else the first."""
+    if len(cands) == 1:
+        return cands[0]
+    if ref is not None:
+        best = min(cands, key=lambda c: math.hypot(c["x_pct"] - ref["x_pct"], c["y_pct"] - ref["y_pct"]))
+        print(f"   {len(cands)} matches; using the one nearest the last action.")
+        return best
+    print(f"   {len(cands)} matches found:")
+    for i, c in enumerate(cands, 1):
+        print(f"    {i}. '{c['label']}' at ({c['x_pct'] * 100:.1f}%, {c['y_pct'] * 100:.1f}%)")
+    if not (execute and interactive):
+        print("   (dry run: showing the first match)")
+        return cands[0]
+    try:
+        answer = input("   Which one? [1] ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+    if not answer:
+        return cands[0]
+    if answer.isdigit() and 1 <= int(answer) <= len(cands):
+        return cands[int(answer) - 1]
+    print("   Not a valid choice; cancelled.")
+    return None
+
+
+def _maybe_learn(target: str, loc: Dict, image: Path, source: str, learn: bool, interactive: bool) -> None:
+    """After a successful action, save the located element as a template (auto in /learn mode, else offered)."""
+    if source in ("template", "context") or not HAS_TEMPLATES:
+        return
+    try:
+        name = validate_name(target)
+    except ValueError:
+        return
+    if load_template(name) is not None:
+        return  # never overwrite a template silently
+    if learn:
+        save = True
+    elif interactive:
+        try:
+            save = input(f"   Save '{name}' as a template for next time? (y/n) ").strip().lower() in ("y", "yes")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            save = False
+    else:
+        save = False
+    if save:
+        try:
+            rel = save_template(image, name, loc["x_pct"], loc["y_pct"])
+            print_template_saved(name, rel, loc["x_pct"], loc["y_pct"])
+        except (ValueError, OSError) as e:
+            print(f"   [Error] Failed to save template: {e}")
+
+
+def _after_changed(before: Path) -> bool:
+    """Verify a click: did the screen change? Unverifiable (no capture) counts as success."""
+    after = _capture_live("after_action.png")
+    if after is None:
+        return True
+    diff = context_memory.image_difference(before, after)
+    return diff is not None and diff > CLICK_EFFECT_THRESHOLD
+
+
+def _note_page_change() -> None:
+    shot = _capture_live("after_action.png")
+    if shot is not None and context_memory.detect_page_change(shot):
+        print("   Page changed: cleared form state and known locations.")
+
+
+def _run_step(intent: Dict, image: Optional[Path], images_dir: Path, execute: bool, learn: bool, interactive: bool) -> bool:
+    """Run one classified action. Dry run (execute=False) only reports what would happen."""
+    if intent.get("needs_clarification"):
+        print(f"   {intent['needs_clarification']}")
+        return False
+    kind = intent["action"]
+    target = intent.get("target")
+    params = intent.get("params") or {}
+
+    if kind == "UNKNOWN":
+        print("   I don't recognise that action.")
+        return False
+
+    if kind == "WAIT":
+        seconds = params["seconds"]
+        if execute:
+            action_executor.wait(seconds)
+        print(f"   {'Waited' if execute else 'Would wait'} {seconds:g}s")
+        return True
+
+    if kind == "SCROLL":
+        direction, amount = params["direction"], params["amount"]
+        if not execute:
+            print(f"   Would scroll {direction} ({amount})")
+            return True
+        ok = action_executor.scroll(direction, amount)
+        print(f"   {'Scrolled' if ok else 'Scroll failed'} {direction}.")
+        return ok
+
+    if kind == "NAVIGATE":
+        url = params.get("url")
+        if not url:
+            print("   No URL given.")
+            return False
+        if not execute:
+            print(f"   Would open {url}")
+            return True
+        ok = action_executor.navigate_to(url)
+        if ok:
+            context_memory.update_context(intent)
+        print(f"   {'Opened' if ok else 'Could not open'} {url}")
+        return ok
+
+    if kind == "TYPE" and params.get("key"):
+        key = params["key"]
+        if not execute:
+            print(f"   Would press {key}")
+            return True
+        return action_executor.press_key(key)
+
+    if kind == "TYPE" and not params.get("text"):
+        print("   Nothing to type.")
+        return False
+
+    if kind == "TYPE" and not target:
+        text = params["text"]
+        if not execute:
+            print(f"   Would type {text!r} into the focused field")
+            return True
+        ok = action_executor.type_text(text)
+        if ok:
+            context_memory.update_context(intent)
+        return ok
+
+    if kind not in ("CLICK", "TYPE", "DRAG"):
+        print(f"   Unsupported action: {kind}")
+        return False
+    if image is None:
+        print("   No screen image to search.")
+        return False
+
+    ref = _last_location()
+    cands, source = locate_target(target, image, ref)
+    if not cands:
+        print(f"   Could not find '{target}' on screen (OCR, YOLO, heuristics all failed).")
+        print("   Use /annotate to train it, or /grid to inspect the screen.")
+        return False
+    loc = _choose_candidate(cands, ref, execute, interactive)
+    if loc is None:
+        return False
+    x, y = loc["x_pct"], loc["y_pct"]
+    print(f"   Found '{target}' via {source} ({loc['confidence'] * 100:.0f}% confidence) at ({x * 100:.1f}%, {y * 100:.1f}%)")
+
+    # Update visual marker for dry run mode
+    if image and not execute:
+        try:
+            auto_mark_target(image, images_dir, x, y, loc.get("label", target))
+        except Exception as e:
+            print(f"   [Warning] Could not update visual marker: {e}")
+
+    if params.get("locate_only"):
+        print("   Located only (question form); nothing clicked.")
+        return True
+    if not execute:
+        verb = {"CLICK": "click", "TYPE": "type into", "DRAG": "drag from"}[kind]
+        print(f"   Would {verb} ({x * 100:.1f}%, {y * 100:.1f}%)")
+        return True
+    if source == "heuristic" and interactive:
+        try:
+            answer = input("   Only a layout guess. Act on it? (y/n) ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return False
+        if answer not in ("y", "yes"):
+            print("   Cancelled.")
+            return False
+
+    if kind == "CLICK":
+        ok = action_executor.click_with_retry(x, y, verify=lambda: _after_changed(image))
+    elif kind == "TYPE":
+        ok = action_executor.type_text(params["text"], x, y)
+    else:
+        destination = params.get("destination")
+        dest_cands, _ = locate_target(destination, image, loc)
+        dest = _choose_candidate(dest_cands, loc, execute, interactive) if dest_cands else None
+        if dest is None:
+            print(f"   Could not find drop target '{destination}'.")
+            return False
+        ok = action_executor.drag((x, y), (dest["x_pct"], dest["y_pct"]))
+    if not ok:
+        print("   Action failed.")
+        return False
+
+    context_memory.update_context({"action": kind, "target": target, "params": params,
+                                   "location": {"x_pct": x, "y_pct": y}})
+    _note_page_change()
+    _maybe_learn(target, loc, image, source, learn, interactive)
+    return True
+
+
+def run_action_pipeline(intent: Dict, base_image: Optional[Path], execute: bool, learn: bool) -> bool:
+    """
+    Run a classified request. With execute=False this is a dry run: it locates targets in
+    `base_image` and reports them without moving the mouse or typing.
+    With execute=True each locating step captures a fresh screenshot of the live display.
+    """
+    t0 = time.time()
+    interactive = sys.stdin.isatty()
+    steps = intent["params"]["steps"] if intent["action"] == "MULTISTEP" else [intent]
+    ok = True
+    for i, step in enumerate(steps, 1):
+        if len(steps) > 1:
+            print(f"Step {i}/{len(steps)}: {step['action']} {step.get('target') or ''}".rstrip())
+        image = base_image
+        if execute and step["action"] in ("CLICK", "TYPE", "DRAG"):
+            image = _capture_live("live_screen.png")
+            if image is None:
+                print("[Error] Could not capture the screen; nothing was done.")
+                return False
+        ok = _run_step(step, image, execute, learn, interactive)
+        if not ok:
+            print("Stopped: that step failed.")
+            break
+    elapsed = time.time() - t0
+    note = "" if elapsed < PIPELINE_BUDGET else f"  (over the {PIPELINE_BUDGET:.0f}s budget)"
+    print(f"Pipeline took {elapsed:.2f}s{note}")
+    return ok
+
+
+def print_context() -> None:
+    ctx = context_memory.get_context()
+    print(f"Current page: {ctx['current_page'] or '(unknown)'}")
+    actions = ctx["last_actions"]
+    print(f"Recent actions ({len(actions)}):")
+    for a in actions:
+        detail = a.get("target") or a.get("url") or ""
+        if a.get("text") is not None:
+            detail += f" text={a['text']!r}"
+        print(f"  - {a['action']} {detail}".rstrip())
+    if not actions:
+        print("  (none)")
+    print(f"Form state: {ctx['form_state'] or '(empty)'}")
+    print(f"Known locations: {len(ctx['known_locations'])}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Vision Agent Harness CLI v0.2 - CPU-Optimized for Raspberry Pi 5"
@@ -371,6 +885,10 @@ def main():
         "--threads", "-t", type=int, default=4,
         help="Number of CPU threads to use (default: 4 for RPi 5)"
     )
+    parser.add_argument(
+        "--execute", action="store_true",
+        help="Actually move the mouse and type for hybrid action requests (default: dry run)"
+    )
     args = parser.parse_args()
 
     project_root = Path(__file__).resolve().parent
@@ -390,8 +908,13 @@ def main():
         selected_image = get_first_image(images_dir)
 
     base_image = selected_image  # Keep reference to original clean image
+    current_mark: Optional[Dict] = None  # Last /mark target, used by /teach
     grid_active = False
     model_used = False  # Becomes True after the first inference query
+    learn_mode = False  # /learn: save located targets as templates automatically after success
+    execute_mode = bool(args.execute and HAS_ACTIONS)  # False = dry run
+    if args.execute and not HAS_ACTIONS:
+        print("[Error] Action modules unavailable; staying in dry-run mode.")
 
     # 2. Setup backend
     print("=" * 65)
@@ -472,6 +995,15 @@ def main():
     print("  /list            - List all images in images/ folder")
     print("  /select <name>   - Select a specific image by name")
     print("  /info            - Show active image info")
+    print("  /annotate        - Open browser tool: click a button and name it (saves a template)")
+    print("  /teach <name>    - Save the last /mark target as a named template")
+    print("  /list-templates  - List trained button templates")
+    print("  /delete-template <name> - Delete a trained button template")
+    print("  /context         - Show current page, recent actions and form state")
+    print("  /clear-context   - Reset the context memory")
+    print("  /test-action <q> - Classify a request without executing it")
+    print("  /learn           - Toggle auto-learning (save successful targets as templates)")
+    print("  /execute on|off  - Enable or disable real mouse/keyboard actions (hybrid mode)")
     print("  /exit, quit      - Exit the CLI\n")
 
     # Interactive REPL Loop
@@ -571,6 +1103,7 @@ def main():
                 src = base_image if base_image else selected_image
                 out_target = images_dir / f"target_{src.name}.png"
                 draw_target_marker(src, x_val, y_val, out_target, label=marker_label)
+                current_mark = {"x": x_val, "y": y_val, "image": src}
                 print(f"\nTarget marked at ({x_val*100:.1f}%, {y_val*100:.1f}%)!")
                 print(f"   Saved preview to: {out_target}")
                 print("   Open this file in your IDE to verify if the box hits the button!\n")
@@ -578,8 +1111,112 @@ def main():
                 print(f"Invalid coordinate numbers: {ve}")
             continue
 
+        if cmd == "/context":
+            if not HAS_ACTIONS:
+                print("[Error] Action modules unavailable.")
+            else:
+                print_context()
+            continue
+
+        if cmd == "/clear-context":
+            if HAS_ACTIONS:
+                context_memory.clear_context()
+                print("Context cleared.")
+            continue
+
+        if cmd.startswith("/test-action"):
+            parts = user_input.split(maxsplit=1)
+            if len(parts) < 2:
+                print("Usage: /test-action <query>")
+            elif not HAS_ACTIONS:
+                print("[Error] Action modules unavailable.")
+            else:
+                t0 = time.perf_counter()
+                intent = classify_intent(parts[1])
+                ms = (time.perf_counter() - t0) * 1000
+                print(json.dumps(intent, indent=2))
+                print(f"Classified in {ms:.2f} ms (nothing executed)")
+            continue
+
+        if cmd == "/learn":
+            learn_mode = not learn_mode
+            print(f"Auto-learn {'ON' if learn_mode else 'OFF'}: successful targets are "
+                  f"{'saved as templates automatically' if learn_mode else 'offered for saving'}.")
+            continue
+
+        if cmd in ("/execute on", "/execute off"):
+            if not HAS_ACTIONS:
+                print("[Error] Action modules unavailable.")
+            else:
+                execute_mode = cmd.endswith("on")
+                print(f"Execute mode {'ON: actions move the real mouse and keyboard' if execute_mode else 'OFF: dry run only'}.")
+            continue
+
         if cmd == "/info":
             print_image_status()
+            continue
+
+        if cmd == "/annotate":
+            if not HAS_ANNOTATE:
+                print("[Error] Annotation tool unavailable (fastapi/uvicorn not importable).")
+                continue
+            if not base_image or not base_image.exists():
+                print("No image selected. Use /select or drop an image in images/")
+                continue
+            run_annotate_session(base_image)
+            continue
+
+        if cmd.startswith("/teach"):
+            parts = user_input.split(maxsplit=1)
+            if len(parts) < 2:
+                print("Usage: /teach <name>")
+                print("Example: /mark 0.972 0.021 then /teach gemini")
+                continue
+            if not HAS_TEMPLATES:
+                print("[Error] Template manager unavailable.")
+                continue
+            if current_mark is None:
+                print("No target marked. Use /mark <x> <y> first, then /teach <name>.")
+                continue
+            try:
+                name = validate_name(parts[1])
+            except ValueError as e:
+                print(f"[Error] {e}")
+                continue
+            if not current_mark["image"].exists():
+                print("[Error] The image used for /mark no longer exists.")
+                continue
+            if not confirm_overwrite(name):
+                print("Not saved.")
+                continue
+            try:
+                rel = save_template(current_mark["image"], name, current_mark["x"], current_mark["y"])
+            except (ValueError, OSError) as e:
+                print(f"[Error] Failed to save template: {e}")
+                continue
+            print_template_saved(name, rel, current_mark["x"], current_mark["y"])
+            continue
+
+        if cmd == "/list-templates":
+            names = list_templates() if HAS_TEMPLATES else []
+            if not names:
+                print("No trained templates yet. Use /annotate, or /mark then /teach <name>.")
+            else:
+                print("Trained templates:")
+                for n in names:
+                    info = get_template_info(n) or {}
+                    print(f"  - {n} ({info.get('crop_size', '?')}px, from {info.get('image_source', '?')})")
+            continue
+
+        if cmd.startswith("/delete-template"):
+            parts = user_input.split(maxsplit=1)
+            if len(parts) < 2:
+                print("Usage: /delete-template <name>")
+                continue
+            if HAS_TEMPLATES and delete_template(parts[1]):
+                print(f"Deleted template '{normalize_name(parts[1])}'.")
+            else:
+                print(f"No template named '{parts[1]}'.")
             continue
 
         # Inference query
@@ -620,7 +1257,11 @@ def main():
                 t0 = time.time()
                 # Always use base_image for detection and marking (not grid overlay)
                 target_image = base_image if base_image else selected_image
-                run_hybrid_query(user_input, target_image, images_dir, first_run=first_run)
+                intent = classify_intent(user_input) if HAS_ACTIONS else None
+                if intent is not None and intent["action"] != "UNKNOWN":
+                    run_action_pipeline(intent, target_image, execute_mode, learn_mode)
+                else:
+                    run_hybrid_query(user_input, target_image, images_dir, first_run=first_run)
                 print(f"Response took {time.time() - t0:.2f}s\n")
             except Exception as e:
                 print(f"\n[Error during hybrid query]: {e}\n")

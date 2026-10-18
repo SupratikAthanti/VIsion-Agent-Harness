@@ -102,8 +102,10 @@ def extract_text_with_coordinates(image_path: Path, resize_max: int = 800) -> Li
 RETRY_WIDTHS = (1600,)
 
 
-def _match_phrase(words: List[Dict], tokens: List[str]) -> Optional[Dict]:
+def _match_all_phrases(words: List[Dict], tokens: List[str]) -> List[Dict]:
+    """Every consecutive, same-line run of words that matches the token sequence."""
     n = len(tokens)
+    matches: List[Dict] = []
     for i in range(len(words) - n + 1):
         window = words[i:i + n]
         if any(w["line"] != window[0]["line"] for w in window):
@@ -118,15 +120,38 @@ def _match_phrase(words: List[Dict], tokens: List[str]) -> Optional[Dict]:
             top = min(w["bbox_px"][1] for w in window)
             right = max(w["bbox_px"][0] + w["bbox_px"][2] for w in window)
             bottom = max(w["bbox_px"][1] + w["bbox_px"][3] for w in window)
-            return {
+            matches.append({
                 "text": " ".join(w["text"] for w in window),
                 "center_x": cx,
                 "center_y": cy,
                 "center_pct": (cx * 100, cy * 100),
                 "bbox_px": (left, top, right - left, bottom - top),
                 "conf": min(w["conf"] for w in window),
-            }
-    return None
+            })
+    return matches
+
+
+def _match_phrase(words: List[Dict], tokens: List[str]) -> Optional[Dict]:
+    matches = _match_all_phrases(words, tokens)
+    return matches[0] if matches else None
+
+
+def find_all_text_elements(image_path: Path, search_text: str, resize_max: int = 800) -> List[Dict]:
+    """
+    Every occurrence of a phrase on screen, in reading order. Uses the same matching
+    rules and width fallback as find_text_element. Returns [] when nothing matches.
+    Dicts have the same keys as find_text_element's result.
+    """
+    tokens = [t for t in (_normalize(p) for p in search_text.split()) if t]
+    if not tokens:
+        return []
+    widths = [resize_max] + [w for w in RETRY_WIDTHS if w > resize_max]
+    for width in widths:
+        words = extract_text_with_coordinates(image_path, resize_max=width)
+        matches = _match_all_phrases(words, tokens)
+        if matches:
+            return matches
+    return []
 
 
 def find_text_element(image_path: Path, search_text: str, resize_max: int = 800) -> Optional[Dict]:
