@@ -29,6 +29,7 @@ except ImportError:
 try:
     from ocr_engine import find_text_element, extract_search_phrase, OCRError
     from tev1_router import route_task, check_tev1_available, TEV1Error
+    from yolo_detector import YOLODetector
     HAS_HYBRID = True
 except ImportError:
     HAS_HYBRID = False
@@ -204,7 +205,26 @@ def format_bytes(size: int) -> str:
     return f"{size:.1f} TB"
 
 
-def run_hybrid_query(query: str, image_path: Path, first_run: bool = False) -> None:
+def auto_mark_target(image_path: Path, images_dir: Path, x_pct: float, y_pct: float, label: str = "TARGET") -> None:
+    """Automatically mark a target on the image without requiring /mark command."""
+    if not HAS_PIL:
+        print("   [Warning] Pillow not available, skipping auto-mark")
+        return
+    
+    if not image_path or not image_path.exists():
+        print(f"   [Warning] Image path invalid or does not exist: {image_path}")
+        return
+    
+    try:
+        out_target = images_dir / f"target_{image_path.name}.png"
+        draw_target_marker(image_path, x_pct, y_pct, out_target, label=label)
+        print(f"   Target automatically marked at ({x_pct*100:.1f}%, {y_pct*100:.1f}%)!")
+        print(f"   Preview saved to: {out_target}\n")
+    except Exception as e:
+        print(f"   [Error] Failed to mark target: {e}\n")
+
+
+def run_hybrid_query(query: str, image_path: Path, images_dir: Path, first_run: bool = False) -> None:
     """Route a request via TEV1, then run OCR with graceful fallbacks, and print the result."""
     try:
         with Spinner("Loading TEV1 router..." if first_run else "Routing request..."):
@@ -221,8 +241,65 @@ def run_hybrid_query(query: str, image_path: Path, first_run: bool = False) -> N
         return
 
     if method == "yolo":
-        print("Note: YOLO icon detection is not wired in yet; falling back to OCR.")
+        try:
+            with Spinner("Running YOLO icon detection..."):
+                detector = YOLODetector()
+                
+                # For new tab icon, try to find text first, then look for nearby icon
+                if 'new tab' in query.lower():
+                    # First try OCR to find "New Tab" text
+                    phrase = extract_search_phrase(query) or "New Tab"
+                    text_hit = find_text_element(image_path, phrase)
+                    
+                    if text_hit:
+                        # Look for small icon near the text
+                        icon_detection = detector.find_icon_near_text(
+                            str(image_path), 
+                            text_hit, 
+                            icon_type='plus'
+                        )
+                        if icon_detection and icon_detection['confidence'] > 0.05:
+                            x_pct, y_pct = icon_detection['center_pct']['x'], icon_detection['center_pct']['y']
+                            print(f"\nFound icon near '{text_hit['text']}' (YOLO confidence {icon_detection['confidence']*100:.0f}%)")
+                            print(f"   Would click at ({x_pct:.1f}%, {y_pct:.1f}%)")
+                            auto_mark_target(image_path, images_dir, x_pct/100, y_pct/100, f"{text_hit['text']} icon")
+                            return
+                        else:
+                            # Text-based icon detection failed, try position-based
+                            print(f"Text-based icon detection failed, trying position-based...")
+                            detection = detector.find_icon_by_position(str(image_path), icon_type='top_bar')
+                            if detection and detection['confidence'] > 0.05:
+                                x_pct, y_pct = detection['center_pct']['x'], detection['center_pct']['y']
+                                print(f"\nFound icon (YOLO confidence {detection['confidence']*100:.0f}%)")
+                                print(f"   Would click at ({x_pct:.1f}%, {y_pct:.1f}%)")
+                                auto_mark_target(image_path, images_dir, x_pct/100, y_pct/100, "icon")
+                                return
+                
+                # Fallback to position-based detection
+                icon_type = 'top_bar'
+                if 'close' in query.lower():
+                    icon_type = 'top_bar'
+                elif 'menu' in query.lower():
+                    icon_type = 'top_left'
+                
+                detection = detector.find_icon_by_position(str(image_path), icon_type=icon_type)
+            
+            if detection is None:
+                print("YOLO found no matching icons in the image.")
+                print("   Falling back to OCR...")
+                method = "ocr"
+            else:
+                x_pct, y_pct = detection['center_pct']['x'], detection['center_pct']['y']
+                print(f"\nFound icon (YOLO confidence {detection['confidence']*100:.0f}%)")
+                print(f"   Would click at ({x_pct:.1f}%, {y_pct:.1f}%)")
+                auto_mark_target(image_path, images_dir, x_pct/100, y_pct/100, "icon")
+                return
+        except Exception as e:
+            print(f"YOLO detection failed: {e}")
+            print("   Falling back to OCR...")
+            method = "ocr"
 
+    # OCR path (either routed to OCR or YOLO fallback)
     phrase = extract_search_phrase(query)
     if not phrase:
         print("Warning: Could not find a label to search for in that request.")
@@ -237,13 +314,41 @@ def run_hybrid_query(query: str, image_path: Path, first_run: bool = False) -> N
 
     if hit is None:
         print(f"OCR could not find '{phrase}' on screen.")
-        print("   YOLO fallback is not available yet. Use /grid to inspect the screen manually.")
-        return
+        print("   Trying YOLO icon detection as fallback...")
+        try:
+            with Spinner("Running YOLO fallback..."):
+                detector = YOLODetector()
+                
+                # Determine icon type based on query
+                icon_type = 'top_bar'
+                if 'new tab' in query.lower():
+                    icon_type = 'top_bar'
+                elif 'close' in query.lower():
+                    icon_type = 'top_bar'
+                elif 'menu' in query.lower():
+                    icon_type = 'top_left'
+                
+                detection = detector.find_icon_by_position(str(image_path), icon_type=icon_type)
+            
+            if detection is None:
+                print("   YOLO also found no matching icons.")
+                print("   Use /grid to inspect the screen manually.")
+                return
+            else:
+                x_pct, y_pct = detection['center_pct']['x'], detection['center_pct']['y']
+                print(f"\nFound icon via YOLO fallback (confidence {detection['confidence']*100:.0f}%)")
+                print(f"   Would click at ({x_pct:.1f}%, {y_pct:.1f}%)")
+                auto_mark_target(image_path, images_dir, x_pct/100, y_pct/100, "icon")
+                return
+        except Exception as e:
+            print(f"   YOLO fallback failed: {e}")
+            print("   Use /grid to inspect the screen manually.")
+            return
 
     x_pct, y_pct = hit["center_pct"]
     print(f"\nFound '{hit['text']}' (OCR confidence {hit['conf']:.0f}%)")
     print(f"   Would click at ({x_pct:.1f}%, {y_pct:.1f}%)")
-    print(f"   Verify with: /mark {hit['center_x']:.3f} {hit['center_y']:.3f} {hit['text']}\n")
+    auto_mark_target(image_path, images_dir, hit['center_x'], hit['center_y'], hit['text'])
 
 
 def main():
@@ -513,7 +618,9 @@ def main():
         elif args.backend == "hybrid":
             try:
                 t0 = time.time()
-                run_hybrid_query(user_input, base_image or selected_image, first_run=first_run)
+                # Always use base_image for detection and marking (not grid overlay)
+                target_image = base_image if base_image else selected_image
+                run_hybrid_query(user_input, target_image, images_dir, first_run=first_run)
                 print(f"Response took {time.time() - t0:.2f}s\n")
             except Exception as e:
                 print(f"\n[Error during hybrid query]: {e}\n")

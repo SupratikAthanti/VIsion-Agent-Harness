@@ -95,7 +95,7 @@ def draw_target_marker(
     y_ratio: float,
     output_path: Optional[Path] = None,
     label: str = "CLICK TARGET",
-    box_radius: int = 24,
+    box_radius: int = 35,
 ) -> Path:
     """
     Draws a high-visibility target marker (reticle circle & crosshair)
@@ -117,17 +117,17 @@ def draw_target_marker(
     # Draw neon outer circle
     draw.ellipse(
         [(px - box_radius, py - box_radius), (px + box_radius, py + box_radius)],
-        outline=(255, 0, 60, 255),
-        width=3,
+        outline=(255, 100, 0, 255),
+        width=4,
     )
     # Inner center dot
     draw.ellipse(
-        [(px - 4, py - 4), (px + 4, py + 4)],
-        fill=(255, 255, 255, 255),
+        [(px - 6, py - 6), (px + 6, py + 6)],
+        fill=(255, 200, 0, 255),
     )
     # Crosshair lines
-    draw.line([(px - box_radius - 10, py), (px + box_radius + 10, py)], fill=(255, 0, 60, 200), width=2)
-    draw.line([(px, py - box_radius - 10), (px, py + box_radius + 10)], fill=(255, 0, 60, 200), width=2)
+    draw.line([(px - box_radius - 15, py), (px + box_radius + 15, py)], fill=(255, 100, 0, 220), width=3)
+    draw.line([(px, py - box_radius - 15), (px, py + box_radius + 15)], fill=(255, 100, 0, 220), width=3)
 
     # Text banner
     banner_text = f"{label} ({px}px, {py}px | {x_ratio*100:.1f}%, {y_ratio*100:.1f}%)"

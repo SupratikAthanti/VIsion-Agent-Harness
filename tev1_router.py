@@ -18,8 +18,8 @@ TEV1_MODEL = "tev1:0.8b"
 TEV1_TIMEOUT = 300  # seconds; CPU inference took ~44s on the first call
 
 METHOD_CRITERIA = {
-    "ocr": "The target is a button, link, tab, label or field identified by visible text on screen.",
-    "yolo": "The target is an icon or graphic with no readable text, such as a hamburger menu, close X or gear icon.",
+    "ocr": "The target is identified by visible text labels on screen (e.g., 'Ask Gemini button', 'New Tab text', 'Settings menu'). Use OCR when the query mentions specific text or labels.",
+    "yolo": "The target is an icon, symbol, or graphic element without readable text (e.g., plus icon, close X, hamburger menu, gear icon, back arrow). Use YOLO when the query asks about icons, symbols, or graphical buttons without mentioning specific text labels.",
     "vision": "The request is a general question about the screen content, not a click target.",
 }
 

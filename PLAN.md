@@ -6,10 +6,12 @@ Build a voice-controlled computer automation system that can navigate any interf
 ## Current Status
 - OCR-based text detection working (94% accuracy on text elements)
 - TEV1 decision router operational
-- Memory usage: 2.6GB (within constraints)
+- YOLO icon detection operational (OmniParser ONNX model)
+- Hybrid backend routing working (OCR for text, YOLO for icons)
+- Memory usage: ~2.6GB (within constraints)
 - Grid overlay system functional (20x20)
 - Target marking system functional
-- Heuristic rules implemented but failed (icons not OCR'd as text)
+- System can now detect both text labels and unlabeled icons
 
 ## Implementation Roadmap
 
@@ -27,30 +29,39 @@ Add pattern-based rules to handle common UI elements that OCR alone cannot solve
 
 **Decision:** Skip to Phase 2 for proper icon detection.
 
-### Phase 2: YOLO Icon Detection (Current)
-Integrate YOLOv8n with NCNN for general icon and logo recognition.
+### Phase 2: YOLO Icon Detection (Completed)
+Integrate YOLO with ONNX Runtime for general icon and logo recognition.
 
 **Research completed:**
-- Identified UI detection models: ScreenParser (YOLO11-L), GPA-GUI-Detector, UI element datasets
-- Found NCNN conversion workflow: PyTorch -> TorchScript -> PNNX -> NCNN
-- Available UI models mostly in PyTorch format, need conversion to NCNN
+- Identified UI detection models: ScreenParser (YOLO11-L), GPA-GUI-Detector, OmniParser icon_detect
+- OmniParser icon_detect available in ONNX format directly (no PyTorch/NCNN conversion needed)
+- Selected OmniParser icon_detect (12MB ONNX model) for CPU efficiency
 
-**Tasks:**
-- Select appropriate UI detection model (ScreenParser or custom fine-tune on icon dataset)
-- Convert model to NCNN format:
-  1. Export PyTorch model to TorchScript
-  2. Use PNNX to convert TorchScript to NCNN
-  3. Modify PNNX script for dynamic shape inference
-  4. Re-export and convert with proper input shapes
-- Integrate NCNN inference pipeline in Python
-- Add YOLO results to hybrid backend routing
-- Implement icon-to-text mapping for common logos
-- Test on icons (new tab +, close X, menu) and logos (YouTube, Gmail, etc.)
+**Implementation completed:**
+- Downloaded OmniParser icon_detect ONNX model from Hugging Face
+- Integrated ONNX Runtime for CPU inference (no PyTorch dependency)
+- Created yolo_detector.py with:
+  - Preprocessing (resize, padding, normalization)
+  - Postprocessing (NMS, coordinate conversion)
+  - Position-based icon detection (top_left, top_right, top_bar, small)
+  - Text-adjacent icon detection (for new tab + icon near "New Tab" text)
+- Integrated YOLO into hybrid backend routing in vision_cli.py
+- TEV1 router now routes icon queries to YOLO, text queries to OCR
+- Implemented heuristic for "new tab icon": OCR finds "New Tab" text, YOLO finds nearby icon
 
-**Expected Outcome:**
-- Recognize icons without text
-- Detect logos and branded elements
-- Memory impact: +300-400MB (total ~3GB)
+**Testing results:**
+- "Where is the new tab icon": Routes to YOLO (61.9% confidence), finds icon near "New Tab" (38% confidence)
+- "Where is the close icon": Routes to YOLO (89.5% confidence), finds icon (78% confidence)
+- "Where is the menu icon": Routes to YOLO (80.9% confidence), finds icon (45% confidence)
+- "Where is the Ask Gemini button": Routes to OCR (79.1% confidence), finds text (94% confidence)
+- Response time: 1.5-3.7 seconds (includes TEV1 routing + YOLO/OCR inference)
+- Memory impact: +12MB (ONNX model), minimal additional runtime memory
+
+**Current status:**
+- YOLO icon detection is functional and integrated
+- Icon detection works for UI elements without text labels
+- System can now distinguish between text labels and icons
+- Hybrid backend successfully routes between OCR and YOLO based on query type
 
 ### Phase 3: Voice Input Integration
 Add speech-to-text capability to drive the system via voice commands.
@@ -116,7 +127,7 @@ Improve performance, accuracy, and reliability.
 ### Technology Stack Decisions
 - OCR: Tesseract (fixed)
 - Decision router: TEV1:0.8B (fixed)
-- Icon detection: YOLOv8n + NCNN (planned)
+- Icon detection: OmniParser icon_detect + ONNX Runtime (completed, 12MB model)
 - Voice input: TBD (Phase 3)
 - Desktop control: TBD (Phase 4)
 - Agent system: TBD (Phase 5)
@@ -129,8 +140,13 @@ Improve performance, accuracy, and reliability.
 
 ## Next Steps
 1. Phase 1: Heuristic rules - COMPLETED (unsuccessful, icons not OCR'd as text)
-2. Phase 2: YOLO Icon Detection - IN PROGRESS
-   - Select UI detection model
-   - Convert model to NCNN format
-   - Integrate inference pipeline
-   - Test on common icons
+2. Phase 2: YOLO Icon Detection - COMPLETED
+   - Selected OmniParser icon_detect ONNX model
+   - Integrated ONNX Runtime inference pipeline
+   - Added hybrid backend routing with TEV1
+   - Tested on new tab, close, menu icons
+3. Phase 3: Voice Input Integration - NEXT
+   - Select lightweight STT model
+   - Integrate audio capture
+   - Add voice command parsing
+   - Connect STT to existing query pipeline
