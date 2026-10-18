@@ -649,7 +649,7 @@ def run_hybrid_query(query: str, image_path: Path, images_dir: Path, first_run: 
     x_pct, y_pct = hit["center_pct"]
     print(f"\nFound '{hit['text']}' (OCR confidence {hit['conf']:.0f}%)")
     print(f"   Would click at ({x_pct:.1f}%, {y_pct:.1f}%)")
-    auto_mark_target(image_path, images_dir, hit['center_x'], hit['center_y'], hit['text'])
+    auto_mark_target(image_path, images_dir, x_pct, y_pct, hit['text'])
 
 
 # ---------------------------------------------------------------------------

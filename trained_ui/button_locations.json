@@ -1,6 +1,21 @@
 {
-  "new tab icon": {
-    "created": "2026-10-18T09:57:53",
+  "ai mode button": {
+    "created": "2026-10-18T10:34:51",
+    "crop_size": 50,
+    "image_source": "1.jpeg"
+  },
+  "gmail button": {
+    "created": "2026-10-18T10:35:14",
+    "crop_size": 50,
+    "image_source": "1.jpeg"
+  },
+  "x": {
+    "created": "2026-10-18T10:36:11",
+    "crop_size": 50,
+    "image_source": "1.jpeg"
+  },
+  "youtube": {
+    "created": "2026-10-18T10:35:35",
     "crop_size": 50,
     "image_source": "1.jpeg"
   }
