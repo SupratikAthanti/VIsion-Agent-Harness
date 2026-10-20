@@ -16,11 +16,28 @@ import webbrowser
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple, Union
 
+from cursor_overlay import CursorOverlay
+
 DEFAULT_DELAY = 0.25      # settle time after each input, seconds
+CURSOR_PREVIEW_SECONDS = 0.6
 XDOTOOL_TIMEOUT = 5       # seconds per xdotool call
 TYPE_DELAY_MS = 30        # delay between typed characters
 SCROLL_BUTTONS = {"up": "4", "down": "5", "left": "6", "right": "7"}
 RETRY_OFFSETS_PX = ((6, 0), (-6, 0), (0, 6), (0, -6))
+_cursor_overlay: Optional[CursorOverlay] = None
+
+
+def _get_cursor_overlay() -> Optional[CursorOverlay]:
+    """Create the cursor overlay on first use, if a desktop display is available."""
+    global _cursor_overlay
+    if not os.environ.get("DISPLAY"):
+        return None
+    if _cursor_overlay is None:
+        try:
+            _cursor_overlay = CursorOverlay()
+        except Exception:
+            return None
+    return _cursor_overlay
 
 
 def _warn(message: str) -> None:
@@ -93,7 +110,24 @@ def click_at(x_pct: float, y_pct: float, offset_px: Tuple[int, int] = (0, 0)) ->
         _warn("could not read the screen size; click skipped")
         return False
     x, y = point[0] + offset_px[0], point[1] + offset_px[1]
-    ok = _run(["mousemove", "--sync", str(x), str(y), "click", "1"])
+    overlay = _get_cursor_overlay()
+    preview_shown = False
+    if overlay is not None:
+        try:
+            preview_shown = overlay.show_cursor(x, y)
+            if preview_shown:
+                time.sleep(CURSOR_PREVIEW_SECONDS)
+        except Exception as e:
+            _warn(f"cursor preview unavailable: {e}")
+
+    try:
+        ok = _run(["mousemove", "--sync", str(x), str(y), "click", "1"])
+    finally:
+        if overlay is not None:
+            try:
+                overlay.hide_cursor()
+            except Exception as e:
+                _warn(f"could not hide cursor preview: {e}")
     time.sleep(DEFAULT_DELAY)
     return ok
 

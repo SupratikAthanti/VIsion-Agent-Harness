@@ -64,6 +64,28 @@ class Clicks(ExecutorBase):
         ax.click_at(0.5, 0.5, offset_px=(6, 0))
         self.assertIn(["mousemove", "--sync", "966", "540", "click", "1"], self.xdotool_calls())
 
+    def test_click_previews_target_and_hides_overlay(self):
+        events = []
+        overlay = mock.Mock()
+        overlay.show_cursor.side_effect = lambda x, y: events.append(("show", x, y)) or True
+        overlay.hide_cursor.side_effect = lambda: events.append(("hide",))
+
+        def run_click(args):
+            events.append(("click", args))
+            return True
+
+        with (
+            mock.patch("action_executor._get_cursor_overlay", return_value=overlay),
+            mock.patch("action_executor._run", side_effect=run_click),
+            mock.patch("action_executor.time.sleep") as sleep,
+        ):
+            self.assertTrue(ax.click_at(0.25, 0.5))
+
+        self.assertEqual(events[0], ("show", 480, 540))
+        self.assertEqual(events[1][0], "click")
+        self.assertEqual(events[2], ("hide",))
+        sleep.assert_any_call(ax.CURSOR_PREVIEW_SECONDS)
+
     def test_no_display_fails_without_calling_xdotool(self):
         with mock.patch.dict(os.environ, {"DISPLAY": ""}):
             self.assertFalse(ax.click_at(0.5, 0.5))
