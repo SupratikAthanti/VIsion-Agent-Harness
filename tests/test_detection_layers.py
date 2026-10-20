@@ -1,7 +1,7 @@
 import sys
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -97,6 +97,71 @@ class DetectionLayerTests(unittest.TestCase):
             vc.atspi_bridge, "find_element_by_name", side_effect=RuntimeError("no bus")
         ):
             self.assertIsNone(vc._atspi_location("Gmail", Path("unused.png")))
+
+    def test_only_known_static_targets_use_templates(self):
+        self.assertTrue(vc._is_static_template_target("Where is the AI mode button?"))
+        self.assertTrue(vc._is_static_template_target("click Gmail button"))
+        self.assertTrue(vc._is_static_template_target("YouTube logo"))
+        self.assertFalse(vc._is_static_template_target("new tab"))
+        self.assertFalse(vc._is_static_template_target("random toolbar button"))
+
+    def test_dynamic_targets_skip_template_matching(self):
+        for query in ("new tab", "close tab", "search bar", "menu item", "unknown logo"):
+            with self.subTest(query=query), patch.object(vc, "list_templates") as templates:
+                self.assertFalse(vc.run_template_query(query, Path("unused.png"), Path(".")))
+                templates.assert_not_called()
+
+    def test_cleanup_removes_dynamic_and_unapproved_templates(self):
+        with (
+            patch.object(vc, "HAS_TEMPLATES", True),
+            patch.object(vc, "list_templates", return_value=["x", "new tab", "gmail button"]),
+            patch.object(vc, "delete_template") as delete,
+        ):
+            vc._clean_dynamic_templates()
+        self.assertEqual(delete.call_args_list, [call("x"), call("new tab")])
+
+    def test_hybrid_pipeline_checks_accessibility_ocr_before_static_template(self):
+        calls = []
+        with (
+            patch.object(vc, "_clean_dynamic_templates"),
+            patch.object(vc, "_atspi_location", side_effect=lambda *args: calls.append("atspi") or None),
+            patch.object(vc, "_ocr_symbol_candidate", side_effect=lambda *args: calls.append("spatial OCR") or None),
+            patch.object(vc, "find_text_element", side_effect=lambda *args: calls.append("OCR") or None),
+            patch.object(vc, "run_template_query", side_effect=lambda *args: calls.append("template") or True),
+            patch.object(vc, "auto_mark_target"),
+        ):
+            vc.run_hybrid_query("click Gmail button", Path("unused.png"), Path("."))
+        self.assertEqual(calls, ["atspi", "OCR", "spatial OCR", "template"])
+
+    def test_hybrid_dynamic_icon_uses_spatial_ocr_before_router(self):
+        with (
+            patch.object(vc, "_clean_dynamic_templates"),
+            patch.object(vc, "_atspi_location") as atspi,
+            patch.object(vc, "find_text_element", return_value=None) as text_ocr,
+            patch.object(vc, "_ocr_symbol_candidate", return_value={
+                "x_pct": 0.25, "y_pct": 0.03, "label": "+"}) as spatial,
+            patch.object(vc, "run_template_query") as template,
+            patch.object(vc, "route_task") as router,
+            patch.object(vc, "auto_mark_target"),
+        ):
+            vc.run_hybrid_query("click the new tab icon", Path("unused.png"), Path("."))
+        atspi.assert_not_called()
+        text_ocr.assert_called_once()
+        spatial.assert_called_once()
+        template.assert_not_called()
+        router.assert_not_called()
+
+    def test_dynamic_target_is_not_learned_as_template(self):
+        with patch.object(vc, "save_template") as save:
+            vc._maybe_learn("search bar", {"x_pct": 0.5, "y_pct": 0.1},
+                            Path("unused.png"), "ocr", learn=True, interactive=False)
+        save.assert_not_called()
+
+    def test_unknown_target_is_not_learned_as_template(self):
+        with patch.object(vc, "save_template") as save:
+            vc._maybe_learn("moving toolbar item", {"x_pct": 0.5, "y_pct": 0.1},
+                            Path("unused.png"), "ocr", learn=True, interactive=False)
+        save.assert_not_called()
 
 
 if __name__ == "__main__":

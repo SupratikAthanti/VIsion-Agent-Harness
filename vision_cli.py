@@ -449,6 +449,11 @@ def run_annotate_session(image_path: Path) -> None:
             if sub.kind == "cancel":
                 print("Annotation cancelled.\n")
                 break
+            if not _is_static_template_target(sub.name):
+                message = "Only known static logos or fixed buttons can be trained; use OCR/AT-SPI for dynamic elements."
+                sub.respond({"status": "declined", "message": message})
+                print(f"Not saved: {message}")
+                continue
             if not confirm_overwrite(sub.name):
                 sub.respond({
                     "status": "declined",
@@ -497,18 +502,61 @@ def find_trained_template(query: str, names: List[str]) -> Optional[str]:
     return max(hits, key=lambda name: len(_normalized_match_text(name))) if hits else None
 
 
+_DYNAMIC_TEMPLATE_TERMS = re.compile(
+    r"\b(?:tabs?|new|close|search|fields?|boxes?|bars?|text|menus?|"
+    r"items?|options?|x)\b",
+    re.IGNORECASE,
+)
+_STATIC_TEMPLATE_NAMES = {"ai mode button", "gmail button", "youtube"}
+_STATIC_TEMPLATE_TOKENS = {
+    "please", "click", "tap", "press", "hit", "select", "find", "locate", "where",
+    "is", "are", "the", "a", "an", "button", "icon", "link", "logo", "fixed", "static",
+}
+
+
+def _is_static_template_target(target: str) -> bool:
+    """Only known fixed visual controls are eligible for matching or training."""
+    target_tokens = [token for token in re.findall(r"[a-z0-9]+", (target or "").casefold())
+                     if token not in _STATIC_TEMPLATE_TOKENS]
+    static_names = [name.casefold().split() for name in _STATIC_TEMPLATE_NAMES]
+    return bool(target_tokens) and any(
+        target_tokens == [token for token in name if token not in {"button", "icon", "link"}]
+        or target_tokens == [name[0]]
+        for name in static_names
+    )
+
+
+def _clean_dynamic_templates() -> None:
+    """Remove legacy templates for known dynamic items from the prior strategy."""
+    if not HAS_TEMPLATES:
+        return
+    for name in list_templates():
+        if _is_dynamic_template_target(name):
+            delete_template(name)
+
+
+def _is_dynamic_template_target(target: str) -> bool:
+    """Dynamic layout targets must use accessible/OCR location, never trained templates."""
+    return bool(_DYNAMIC_TEMPLATE_TERMS.search(target or ""))
+
+
 def run_template_query(query: str, image_path: Path, images_dir: Path) -> bool:
     """
-    Try trained templates first. Returns True if a template matched and was printed;
-    False means the caller should fall through to OCR / YOLO.
+    Try a matching static template. Returns True if a template matched and was printed;
+    False means the caller should fall through to the next detection layer.
     """
-    if not HAS_TEMPLATES:
+    if not HAS_TEMPLATES or _is_dynamic_template_target(query):
+        return False
+    target = extract_search_phrase(query)
+    if not _is_static_template_target(target):
         return False
     names = list_templates()
     name = find_trained_template(query, names) if names else None
-    if name is None:
+    if name is None or not _is_static_template_target(name):
         return False
 
+    # OCR is preferred, so this is only reached after text/spatial OCR missed.
+    # Keep template matching for static visual elements whose appearance is stable.
     print(f"Checking trained templates... Found \"{name}\"")
     template_path = load_template(name)
     if template_path is None:
@@ -530,7 +578,8 @@ def run_template_query(query: str, image_path: Path, images_dir: Path) -> bool:
 
 
 def run_hybrid_query(query: str, image_path: Path, images_dir: Path, first_run: bool = False) -> None:
-    """Try accessibility and trained templates first, then route to OCR/YOLO."""
+    """Locate in order: AT-SPI, OCR/spatial heuristics, static templates, then YOLO/vision."""
+    _clean_dynamic_templates()
     target_name = extract_search_phrase(query)
     # Icon requests should not resolve to a nearby text label through accessibility.
     icon_request = bool(re.search(r"\bicon\b", query, re.IGNORECASE))
@@ -541,8 +590,20 @@ def run_hybrid_query(query: str, image_path: Path, images_dir: Path, first_run: 
         print(f"   Would click at ({x_pct * 100:.1f}%, {y_pct * 100:.1f}%)")
         auto_mark_target(image_path, images_dir, x_pct, y_pct, accessible["label"])
         return
-    if run_template_query(query, image_path, images_dir):
-        return
+
+    # Search the requested text first; refine it to a nearby icon only for
+    # icon-oriented queries where clicking a text label would be wrong.
+    phrase = target_name
+    hit = None
+    if phrase:
+        try:
+            with Spinner("Running OCR..."):
+                hit = find_text_element(image_path, phrase)
+        except OCRError as e:
+            print(f"[Error] OCR failed: {e}")
+    else:
+        print("Warning: Could not find a label to search for in that request.")
+
     symbol = _ocr_symbol_candidate(image_path, query)
     if symbol:
         x_pct, y_pct = symbol["x_pct"], symbol["y_pct"]
@@ -551,17 +612,27 @@ def run_hybrid_query(query: str, image_path: Path, images_dir: Path, first_run: 
         auto_mark_target(image_path, images_dir, x_pct, y_pct, symbol["label"])
         return
 
+    if hit is not None and not icon_request:
+        x_pct, y_pct = hit["center_pct"]
+        print(f"\nFound '{hit['text']}' (OCR confidence {hit['conf']:.0f}%)")
+        print(f"   Would click at ({x_pct:.1f}%, {y_pct:.1f}%)")
+        auto_mark_target(image_path, images_dir, x_pct, y_pct, hit["text"])
+        return
+    if phrase and hit is None:
+        print(f"OCR could not find '{phrase}' on screen.")
+
+    # Tabs, search controls, menu items and similar targets move with the layout.
+    # Never use a crop trained at one position for these queries.
+    if run_template_query(query, image_path, images_dir):
+        return
+
     try:
         with Spinner("Loading TEV1 router..." if first_run else "Routing request..."):
             route = route_task(query)
         method = route["method"]
         print(f"TEV1 route: {method} (confidence {route['confidence'] * 100:.1f}%)")
     except TEV1Error as e:
-        print(f"Warning: TEV1 routing failed ({e}); defaulting to OCR.")
-        method = "ocr"
-
-    if re.search(r"\bicon\b", query, re.IGNORECASE):
-        # If spatial OCR didn't find an icon glyph, do not substitute a text-label click.
+        print(f"Warning: TEV1 routing failed ({e}); defaulting to YOLO fallback.")
         method = "yolo"
 
     if method == "vision":
@@ -569,87 +640,37 @@ def run_hybrid_query(query: str, image_path: Path, images_dir: Path, first_run: 
         print("   Ask about a visible label instead, e.g. 'Where is the <label> button?'")
         return
 
-    if method == "yolo":
-        try:
-            with Spinner("Running YOLO icon detection..."):
-                detector = YOLODetector()
-                lowered_query = query.casefold()
-                icon_type = "top_left" if "menu" in lowered_query else "top_bar"
-                detection = detector.find_icon_by_position(str(image_path), icon_type=icon_type)
-
-            if detection is not None:
-                if not _reliable_yolo_detection(detection, image_path):
-                    print("   No reliable match found.")
-                    _suggest_annotation()
-                    return
-                x_pct, y_pct = detection["center_pct"]["x"], detection["center_pct"]["y"]
-                print(f"\nFound icon (YOLO confidence {detection['confidence'] * 100:.0f}%)")
-                print(f"   Would click at ({x_pct:.1f}%, {y_pct:.1f}%)")
-                auto_mark_target(image_path, images_dir, x_pct / 100, y_pct / 100, "icon")
-                return
-            print("YOLO found no matching icons in the image.")
-            if icon_request:
-                print("   No reliable match found.")
-                _suggest_annotation()
-                return
-            print("   Falling back to OCR...")
-            method = "ocr"
-        except Exception as e:
-            print(f"YOLO detection failed: {e}")
-            if icon_request:
-                print("   No reliable match found.")
-                _suggest_annotation()
-                return
-            print("   Falling back to OCR...")
-            method = "ocr"
-
-    # OCR path (either routed to OCR or YOLO fallback)
-    phrase = extract_search_phrase(query)
-    if not phrase:
-        print("Warning: Could not find a label to search for in that request.")
-        return
-
+    # OCR already ran above; route icon-only and otherwise-unresolved targets to YOLO.
     try:
-        with Spinner("Running OCR..."):
-            hit = find_text_element(image_path, phrase)
-    except OCRError as e:
-        print(f"[Error] OCR failed: {e}")
-        return
+        with Spinner("Running YOLO icon detection..." if method == "yolo" else "Running YOLO fallback..."):
+            detector = YOLODetector()
+            lowered_query = query.casefold()
+            icon_type = "top_left" if "menu" in lowered_query else "top_bar"
+            detection = detector.find_icon_by_position(str(image_path), icon_type=icon_type)
 
-    if hit is None:
-        print(f"OCR could not find '{phrase}' on screen.")
-        print("   Trying YOLO icon detection as fallback...")
-        try:
-            with Spinner("Running YOLO fallback..."):
-                detector = YOLODetector()
-                
-                # Determine icon type based on query
-                icon_type = "top_left" if "menu" in query.lower() else "top_bar"
-                detection = detector.find_icon_by_position(str(image_path), icon_type=icon_type)
-            
-            if detection is None:
-                print("   YOLO also found no matching icons.")
-                print("   Use /grid to inspect the screen manually.")
+        if detection is not None:
+            if not _reliable_yolo_detection(detection, image_path):
+                print("   No reliable match found.")
+                _suggest_annotation()
                 return
-            else:
-                if not _reliable_yolo_detection(detection, image_path):
-                    print("   No reliable match found.")
-                    _suggest_annotation()
-                    return
-                x_pct, y_pct = detection["center_pct"]["x"], detection["center_pct"]["y"]
-                print(f"\nFound icon via YOLO fallback (confidence {detection['confidence']*100:.0f}%)")
-                print(f"   Would click at ({x_pct:.1f}%, {y_pct:.1f}%)")
-                auto_mark_target(image_path, images_dir, x_pct/100, y_pct/100, "icon")
-                return
-        except Exception as e:
-            print(f"   YOLO fallback failed: {e}")
-            print("   Use /grid to inspect the screen manually.")
+            x_pct, y_pct = detection["center_pct"]["x"], detection["center_pct"]["y"]
+            print(f"\nFound icon (YOLO confidence {detection['confidence'] * 100:.0f}%)")
+            print(f"   Would click at ({x_pct:.1f}%, {y_pct:.1f}%)")
+            auto_mark_target(image_path, images_dir, x_pct / 100, y_pct / 100, "icon")
             return
-
-    x_pct, y_pct = hit["center_pct"]
-    print(f"\nFound '{hit['text']}' (OCR confidence {hit['conf']:.0f}%)")
-    print(f"   Would click at ({x_pct:.1f}%, {y_pct:.1f}%)")
-    auto_mark_target(image_path, images_dir, x_pct, y_pct, hit['text'])
+        print("YOLO found no matching icons in the image.")
+        if icon_request:
+            print("   No reliable match found.")
+            _suggest_annotation()
+        else:
+            print("   Use /grid to inspect the screen manually.")
+    except Exception as e:
+        print(f"YOLO detection failed: {e}")
+        if icon_request:
+            print("   No reliable match found.")
+            _suggest_annotation()
+        else:
+            print("   Use /grid to inspect the screen manually.")
 
 
 # ---------------------------------------------------------------------------
@@ -739,16 +760,6 @@ def locate_target(target: str, image: Path, ref: Optional[Dict] = None,
     if accessible and not (kind == "icon" or "icon" in target.casefold()):
         return [accessible], "atspi"
 
-    if HAS_TEMPLATES:
-        names = list_templates()
-        name = find_trained_template(target, names) if names else None
-        if name:
-            template = load_template(name)
-            match = find_template(image, template, threshold=TEMPLATE_THRESHOLD) if template else None
-            if match:
-                return [{"x_pct": match["x_pct"], "y_pct": match["y_pct"],
-                         "confidence": match["confidence"], "source": "template", "label": name}], "template"
-
     symbol = _safe(lambda: _ocr_symbol_candidate(image, target, kind), "spatial OCR")
     if symbol:
         return [symbol], "ocr"
@@ -757,6 +768,15 @@ def locate_target(target: str, image: Path, ref: Optional[Dict] = None,
         cands = _safe(lambda: _ocr_candidates(image, target), "OCR")
         if cands:
             return cands, "ocr"
+    if HAS_TEMPLATES and _is_static_template_target(target):
+        names = list_templates()
+        name = find_trained_template(target, names) if names else None
+        if name and _is_static_template_target(name):
+            template = load_template(name)
+            match = find_template(image, template, threshold=TEMPLATE_THRESHOLD) if template else None
+            if match:
+                return [{"x_pct": match["x_pct"], "y_pct": match["y_pct"],
+                         "confidence": match["confidence"], "source": "template", "label": name}], "template"
     global _yolo_rejected_unreliable
     _yolo_rejected_unreliable = False
     cand = _safe(lambda: _yolo_candidate(image, target), "YOLO")
@@ -811,12 +831,14 @@ def _choose_candidate(cands: List[Dict], ref: Optional[Dict], execute: bool, int
 
 
 def _maybe_learn(target: str, loc: Dict, image: Path, source: str, learn: bool, interactive: bool) -> None:
-    """After a successful action, save the located element as a template (auto in /learn mode, else offered)."""
+    """Save only non-dynamic targets as templates (auto in /learn mode, else offered)."""
     if source in ("template", "context") or not HAS_TEMPLATES:
         return
     try:
         name = validate_name(target)
     except ValueError:
+        return
+    if not _is_static_template_target(name):
         return
     if load_template(name) is not None:
         return  # never overwrite a template silently
@@ -1353,6 +1375,9 @@ def main():
                 continue
             if not current_mark["image"].exists():
                 print("[Error] The image used for /mark no longer exists.")
+                continue
+            if not _is_static_template_target(name):
+                print("[Error] Only known static logos or fixed buttons can be trained; use OCR/AT-SPI for dynamic elements.")
                 continue
             if not confirm_overwrite(name):
                 print("Not saved.")
