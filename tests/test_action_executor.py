@@ -55,14 +55,122 @@ class Coordinates(ExecutorBase):
         self.assertEqual(ax.get_screen_size(), SCREEN)
 
 
+class AtspiActions(unittest.TestCase):
+    def test_click_element_invokes_click_action_by_name(self):
+        action = mock.Mock(nActions=2)
+        action.getName.side_effect = ["show", "click"]
+        action.doAction.return_value = True
+        accessible = mock.Mock()
+        accessible.queryAction.return_value = action
+        backend = (mock.sentinel.pyatspi, "pyatspi")
+        with (
+            mock.patch.object(ax.atspi_bridge, "_backend", return_value=backend),
+            mock.patch.object(ax.atspi_bridge, "_resolve_ref", return_value=accessible),
+        ):
+            self.assertTrue(ax.atspi_bridge.click_element("/0/1"))
+        action.doAction.assert_called_once_with(1)
+
+    def test_click_element_returns_false_when_no_supported_action(self):
+        action = mock.Mock(nActions=1)
+        action.getName.return_value = "focus"
+        accessible = mock.Mock()
+        accessible.queryAction.return_value = action
+        backend = (mock.sentinel.pyatspi, "pyatspi")
+        with (
+            mock.patch.object(ax.atspi_bridge, "_backend", return_value=backend),
+            mock.patch.object(ax.atspi_bridge, "_resolve_ref", return_value=accessible),
+        ):
+            self.assertFalse(ax.atspi_bridge.click_element("/0/1"))
+        action.doAction.assert_not_called()
+
+
 class Clicks(ExecutorBase):
     def test_click_at_sends_absolute_move_and_click(self):
-        self.assertTrue(ax.click_at(0.25, 0.5))
+        with mock.patch("action_executor._focus_window_at", return_value=True):
+            self.assertTrue(ax.click_at(0.25, 0.5))
         self.assertIn(["mousemove", "--sync", "480", "540", "click", "1"], self.xdotool_calls())
 
     def test_click_with_offset(self):
-        ax.click_at(0.5, 0.5, offset_px=(6, 0))
+        with mock.patch("action_executor._focus_window_at", return_value=True):
+            ax.click_at(0.5, 0.5, offset_px=(6, 0))
         self.assertIn(["mousemove", "--sync", "966", "540", "click", "1"], self.xdotool_calls())
+
+    def test_atspi_action_click_does_not_focus_or_use_xdotool(self):
+        with (
+            mock.patch("action_executor.atspi_bridge.is_at_spi_available", return_value=True),
+            mock.patch("action_executor.atspi_bridge.click_element", return_value=True) as click,
+            mock.patch("action_executor._focus_window_at") as focus,
+        ):
+            self.assertTrue(ax.click_at(0.25, 0.5, accessible_ref="/0/1"))
+        click.assert_called_once_with("/0/1")
+        focus.assert_not_called()
+        self.assertEqual(self.xdotool_calls(), [])
+
+    def test_atspi_unavailable_falls_back_to_focus_then_xdotool(self):
+        events = []
+
+        def run_click(args):
+            events.append(("xdotool", args))
+            return True
+
+        with (
+            mock.patch("action_executor.atspi_bridge.is_at_spi_available", return_value=False),
+            mock.patch("action_executor._focus_window_at", side_effect=lambda x, y: events.append(("focus", x, y)) or True),
+            mock.patch("action_executor._run", side_effect=run_click),
+        ):
+            self.assertTrue(ax.click_at(0.25, 0.5))
+        self.assertEqual(events[0], ("focus", 480, 540))
+        self.assertEqual(events[1][0], "xdotool")
+
+    def test_failed_atspi_action_falls_back_to_wmctrl_and_xdotool(self):
+        with (
+            mock.patch("action_executor.atspi_bridge.is_at_spi_available", return_value=True),
+            mock.patch("action_executor.atspi_bridge.click_element", return_value=False),
+            mock.patch("action_executor._focus_window_at", return_value=True) as focus,
+            mock.patch("action_executor._run", return_value=True) as run,
+        ):
+            self.assertTrue(ax.click_at(0.25, 0.5, accessible_ref="/0/1"))
+        focus.assert_called_once_with(480, 540)
+        run.assert_called_once()
+
+    def test_atspi_action_can_be_disabled(self):
+        with (
+            mock.patch("action_executor.atspi_bridge.is_at_spi_available") as available,
+            mock.patch("action_executor._focus_window_at", return_value=True),
+            mock.patch("action_executor._run", return_value=True),
+        ):
+            self.assertTrue(ax.click_at(0.25, 0.5, use_atspi_action=False))
+        available.assert_not_called()
+
+    def test_wmctrl_focuses_smallest_window_containing_target(self):
+        outputs = [
+            fake_run(stdout="0x001 0 0 0 1920 1080 desktop\n"
+                            "0x002 0 0 0 900 1080 terminal\n"
+                            "0x003 0 900 0 1020 1080 chrome\n"),
+            fake_run(),
+        ]
+        with (
+            mock.patch("action_executor.shutil.which", side_effect=lambda name: f"/usr/bin/{name}"),
+            mock.patch("action_executor.subprocess.run", side_effect=outputs) as run,
+        ):
+            self.assertTrue(ax._focus_window_at(1200, 500))
+        self.assertEqual(run.call_args_list[1].args[0], ["/usr/bin/wmctrl", "-ia", "0x003"])
+
+    def test_no_window_at_target_refuses_to_click(self):
+        with (
+            mock.patch("action_executor._focus_window_at", return_value=False),
+            mock.patch("action_executor._run") as run,
+        ):
+            self.assertFalse(ax.click_at(0.25, 0.5))
+        run.assert_not_called()
+
+    def test_wmctrl_missing_fails_without_running_xdotool(self):
+        with (
+            mock.patch("action_executor.shutil.which", side_effect=lambda name: "/usr/bin/xdotool" if name == "xdotool" else None),
+            mock.patch("action_executor._run") as run,
+        ):
+            self.assertFalse(ax.click_at(0.25, 0.5))
+        run.assert_not_called()
 
     def test_click_previews_target_and_hides_overlay(self):
         events = []
@@ -76,6 +184,7 @@ class Clicks(ExecutorBase):
 
         with (
             mock.patch("action_executor._get_cursor_overlay", return_value=overlay),
+            mock.patch("action_executor._focus_window_at", return_value=True),
             mock.patch("action_executor._run", side_effect=run_click),
             mock.patch("action_executor.time.sleep") as sleep,
         ):
@@ -108,11 +217,13 @@ class Clicks(ExecutorBase):
             return fake_run(returncode=0 if next(results) else 1)
 
         self.mock_run.side_effect = side_effect
-        self.assertTrue(ax.click_with_retry(0.5, 0.5))
+        with mock.patch("action_executor._focus_window_at", return_value=True):
+            self.assertTrue(ax.click_with_retry(0.5, 0.5))
 
     def test_retry_with_verify_repeats_until_effect(self):
         verdicts = iter([False, False, True])  # first click, first retry, second retry
-        self.assertTrue(ax.click_with_retry(0.5, 0.5, verify=lambda: next(verdicts), retries=2))
+        with mock.patch("action_executor._focus_window_at", return_value=True):
+            self.assertTrue(ax.click_with_retry(0.5, 0.5, verify=lambda: next(verdicts), retries=2))
         clicks = [c for c in self.xdotool_calls() if c[0] == "mousemove"]
         self.assertEqual(len(clicks), 3)
         self.assertNotEqual(clicks[0], clicks[1])  # retries use a pixel offset
@@ -123,7 +234,8 @@ class Clicks(ExecutorBase):
 
 class Typing(ExecutorBase):
     def test_type_text_clicks_field_then_types(self):
-        self.assertTrue(ax.type_text("hello", 0.5, 0.1))
+        with mock.patch("action_executor._focus_window_at", return_value=True):
+            self.assertTrue(ax.type_text("hello", 0.5, 0.1))
         calls = self.xdotool_calls()
         self.assertEqual(calls[0][0], "mousemove")
         self.assertEqual(calls[-1][-2:], ["--", "hello"])

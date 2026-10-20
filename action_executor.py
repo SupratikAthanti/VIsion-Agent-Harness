@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Callable, List, Optional, Tuple, Union
 
 from cursor_overlay import CursorOverlay
+import atspi_bridge
 
 DEFAULT_DELAY = 0.25      # settle time after each input, seconds
 CURSOR_PREVIEW_SECONDS = 0.6
@@ -103,19 +104,73 @@ def to_absolute(x_pct: float, y_pct: float, screen: Optional[Tuple[int, int]] = 
     return min(w - 1, round(x_pct * w)), min(h - 1, round(y_pct * h))
 
 
-def click_at(x_pct: float, y_pct: float, offset_px: Tuple[int, int] = (0, 0)) -> bool:
-    """Move the pointer to a fractional screen position and left-click."""
+def _focus_window_at(x: int, y: int) -> bool:
+    """Use wmctrl to activate the smallest window containing a screen point."""
+    wmctrl = shutil.which("wmctrl")
+    if not wmctrl:
+        _warn("wmctrl is not installed; cannot focus the target window")
+        return False
+    if not os.environ.get("DISPLAY"):
+        _warn("no X display (DISPLAY is not set); cannot focus the target window")
+        return False
+    try:
+        listing = subprocess.run([wmctrl, "-lG"], capture_output=True, text=True,
+                                 timeout=XDOTOOL_TIMEOUT)
+        if listing.returncode != 0:
+            _warn(f"wmctrl could not list windows: {listing.stderr.strip()[:120]}")
+            return False
+        matches = []
+        for line in listing.stdout.splitlines():
+            fields = line.split(None, 7)
+            if len(fields) < 6:
+                continue
+            try:
+                left, top, width, height = (int(value) for value in fields[2:6])
+            except ValueError:
+                continue
+            if width > 0 and height > 0 and left <= x < left + width and top <= y < top + height:
+                matches.append((width * height, fields[0]))
+        if not matches:
+            _warn(f"wmctrl found no window containing target point ({x}, {y})")
+            return False
+        _, window_id = min(matches)
+        activated = subprocess.run([wmctrl, "-ia", window_id], capture_output=True,
+                                   text=True, timeout=XDOTOOL_TIMEOUT)
+        if activated.returncode != 0:
+            _warn(f"wmctrl could not focus window {window_id}: {activated.stderr.strip()[:120]}")
+            return False
+        return True
+    except (OSError, subprocess.TimeoutExpired) as e:
+        _warn(f"wmctrl failed: {e}")
+        return False
+
+
+def click_at(x_pct: float, y_pct: float, offset_px: Tuple[int, int] = (0, 0),
+             accessible_ref: Optional[str] = None, use_atspi_action: bool = True) -> bool:
+    """Click a fractional screen position, preferring its focus-independent AT-SPI action."""
+    if use_atspi_action:
+        try:
+            atspi_available = atspi_bridge.is_at_spi_available()
+            if atspi_available and accessible_ref:
+                if atspi_bridge.click_element(accessible_ref):
+                    time.sleep(DEFAULT_DELAY)
+                    return True
+                _warn("AT-SPI click failed; focusing the target window and using xdotool")
+        except Exception as e:
+            _warn(f"AT-SPI click unavailable: {e}; focusing the target window and using xdotool")
+
     point = to_absolute(x_pct, y_pct)
     if point is None:
         _warn("could not read the screen size; click skipped")
         return False
     x, y = point[0] + offset_px[0], point[1] + offset_px[1]
+    if not _focus_window_at(x, y):
+        return False
+
     overlay = _get_cursor_overlay()
-    preview_shown = False
     if overlay is not None:
         try:
-            preview_shown = overlay.show_cursor(x, y)
-            if preview_shown:
+            if overlay.show_cursor(x, y):
                 time.sleep(CURSOR_PREVIEW_SECONDS)
         except Exception as e:
             _warn(f"cursor preview unavailable: {e}")
@@ -133,18 +188,21 @@ def click_at(x_pct: float, y_pct: float, offset_px: Tuple[int, int] = (0, 0)) ->
 
 
 def click_with_retry(x_pct: float, y_pct: float,
-                     verify: Optional[Callable[[], bool]] = None, retries: int = 2) -> bool:
+                     verify: Optional[Callable[[], bool]] = None, retries: int = 2,
+                     accessible_ref: Optional[str] = None, use_atspi_action: bool = True) -> bool:
     """
     Click, then check the result with `verify` (returns True when the click had an effect).
     If it did not, retry with a small pixel offset around the target. Without `verify`,
     only a failed xdotool call is retried.
     """
-    ok = click_at(x_pct, y_pct)
+    ok = click_at(x_pct, y_pct, accessible_ref=accessible_ref,
+                  use_atspi_action=use_atspi_action)
     if verify is None:
         if ok:
             return True
         for offset in RETRY_OFFSETS_PX[:retries]:
-            if click_at(x_pct, y_pct, offset):
+            if click_at(x_pct, y_pct, offset, accessible_ref=accessible_ref,
+                        use_atspi_action=use_atspi_action):
                 return True
         return False
 
@@ -152,7 +210,8 @@ def click_with_retry(x_pct: float, y_pct: float,
         return True
     for offset in RETRY_OFFSETS_PX[:retries]:
         _warn(f"click had no visible effect; retrying with {offset} px offset")
-        if click_at(x_pct, y_pct, offset) and verify():
+        if click_at(x_pct, y_pct, offset, accessible_ref=accessible_ref,
+                    use_atspi_action=use_atspi_action) and verify():
             return True
     return False
 
@@ -160,7 +219,7 @@ def click_with_retry(x_pct: float, y_pct: float,
 def type_text(text: str, x_pct: Optional[float] = None, y_pct: Optional[float] = None) -> bool:
     """Focus the field at (x_pct, y_pct) by clicking it, then type `text`. Without coordinates, types into the focused window."""
     if x_pct is not None and y_pct is not None:
-        if not click_at(x_pct, y_pct):
+        if not click_at(x_pct, y_pct, use_atspi_action=False):
             return False
     ok = _run(["type", "--delay", str(TYPE_DELAY_MS), "--", text])
     time.sleep(DEFAULT_DELAY)

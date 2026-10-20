@@ -965,7 +965,8 @@ def _run_step(intent: Dict, image: Optional[Path], images_dir: Path, execute: bo
             return False
 
     if kind == "CLICK":
-        ok = action_executor.click_with_retry(x, y, verify=lambda: _after_changed(image))
+        ok = action_executor.click_with_retry(
+            x, y, verify=lambda: _after_changed(image), accessible_ref=loc.get("ref"))
     elif kind == "TYPE":
         ok = action_executor.type_text(params["text"], x, y)
     else:

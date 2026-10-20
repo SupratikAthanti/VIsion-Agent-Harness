@@ -167,17 +167,50 @@ def find_element_by_role(role: str) -> List[Dict]:
             if element["bounds"] and query in _normalize(element["role"])]
 
 
+def _resolve_ref(ref: str, backend):
+    """Resolve a tree reference returned by this module to its accessible object."""
+    accessible = _desktop(backend)
+    for index in (int(part) for part in ref.split("/") if part):
+        accessible = _child_at(accessible, index)
+    return accessible
+
+
 def get_element_bounds(ref: str) -> Optional[Tuple[int, int, int, int]]:
     """Resolve a tree reference returned by this module and return screen-pixel bounds."""
     backend = _backend()
     if backend is None:
         return None
     try:
-        accessible = _desktop(backend)
-        for index in (int(part) for part in ref.split("/") if part):
-            accessible = _child_at(accessible, index)
-        return _bounds(accessible, backend)
+        return _bounds(_resolve_ref(ref, backend), backend)
     except (ValueError, IndexError, TypeError):
         return None
     except Exception:
         return None
+
+
+def click_element(ref: str) -> bool:
+    """Invoke an accessible element's click/press action without moving the pointer."""
+    backend = _backend()
+    if backend is None or not ref:
+        return False
+    try:
+        accessible = _resolve_ref(ref, backend)
+        if backend[1] == "gi":
+            action = accessible.get_action_iface()
+            action_count = action.get_n_actions()
+            get_name = action.get_action_name
+            do_action = action.do_action
+        else:
+            action = accessible.queryAction()
+            action_count = action.nActions
+            get_name = action.getName
+            do_action = action.doAction
+
+        preferred_actions = ("click", "press", "activate")
+        for preferred in preferred_actions:
+            for index in range(int(action_count)):
+                if str(get_name(index) or "").casefold() == preferred:
+                    return bool(do_action(index))
+        return False
+    except Exception:
+        return False
