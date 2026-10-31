@@ -44,6 +44,13 @@ try:
 except ImportError:
     HAS_ATSPI = False
 
+# Playwright browser bridge (direct browser engine control)
+try:
+    import playwright_bridge
+    HAS_PLAYWRIGHT = playwright_bridge.HAS_PLAYWRIGHT
+except ImportError:
+    HAS_PLAYWRIGHT = False
+
 # Trained UI templates (/annotate, /teach, template-first queries)
 try:
     from template_manager import (
@@ -895,11 +902,38 @@ def _run_step(intent: Dict, image: Optional[Path], images_dir: Path, execute: bo
         print(f"   {'Waited' if execute else 'Would wait'} {seconds:g}s")
         return True
 
+    if kind == "READ":
+        if HAS_PLAYWRIGHT and playwright_bridge.is_browser_open():
+            read_kind = params.get("kind", "page")
+            if read_kind == "table":
+                rows = playwright_bridge.read_table(target)
+                if rows:
+                    print("   [Playwright] Table data:")
+                    for row in rows[:15]:
+                        print("   " + " | ".join(row))
+                    return True
+                print("   [Playwright] No table found matching target.")
+                return False
+            else:
+                text = playwright_bridge.read_content(target)
+                if text:
+                    print("   [Playwright] Page content:")
+                    for line in text.splitlines()[:25]:
+                        print("   " + line)
+                    return True
+                print("   [Playwright] No text content found.")
+                return False
+        print("   'Read' action requires an active Playwright browser session.")
+        return False
+
     if kind == "SCROLL":
         direction, amount = params["direction"], params["amount"]
         if not execute:
             print(f"   Would scroll {direction} ({amount})")
             return True
+        if HAS_PLAYWRIGHT and playwright_bridge.is_browser_open():
+            if playwright_bridge.scroll(direction, amount):
+                return True
         ok = action_executor.scroll(direction, amount)
         print(f"   {'Scrolled' if ok else 'Scroll failed'} {direction}.")
         return ok
@@ -912,6 +946,12 @@ def _run_step(intent: Dict, image: Optional[Path], images_dir: Path, execute: bo
         if not execute:
             print(f"   Would open {url}")
             return True
+        # Architectural Pivot: Direct browser engine control via Playwright
+        if HAS_PLAYWRIGHT:
+            ok = playwright_bridge.navigate(url)
+            if ok:
+                return True
+            print("   [Playwright] navigation failed; falling back to default browser...")
         ok = action_executor.navigate_to(url)
         if ok:
             context_memory.update_context(intent)
@@ -923,6 +963,9 @@ def _run_step(intent: Dict, image: Optional[Path], images_dir: Path, execute: bo
         if not execute:
             print(f"   Would press {key}")
             return True
+        if HAS_PLAYWRIGHT and playwright_bridge.is_browser_open():
+            if playwright_bridge.press_key(key):
+                return True
         return action_executor.press_key(key)
 
     if kind == "TYPE" and not params.get("text"):
@@ -934,10 +977,30 @@ def _run_step(intent: Dict, image: Optional[Path], images_dir: Path, execute: bo
         if not execute:
             print(f"   Would type {text!r} into the focused field")
             return True
+        if HAS_PLAYWRIGHT and playwright_bridge.is_browser_open():
+            if playwright_bridge.type_text(text):
+                return True
         ok = action_executor.type_text(text)
         if ok:
             context_memory.update_context(intent)
         return ok
+
+    # Browser DOM fast path: if Playwright browser is open, try DOM actions first
+    if kind in ("CLICK", "TYPE") and HAS_PLAYWRIGHT and playwright_bridge.is_browser_open():
+        if not execute:
+            loc = playwright_bridge.get_bridge().find_element_locator(target, kind=params.get("kind"))
+            if loc is not None:
+                verb = "click" if kind == "CLICK" else f"type {params.get('text')!r} into"
+                print(f"   Would {verb} '{target}' via Playwright (DOM element matched)")
+                return True
+        else:
+            if kind == "CLICK":
+                if playwright_bridge.click_element(target, kind=params.get("kind")):
+                    return True
+            elif kind == "TYPE":
+                if playwright_bridge.type_text(params.get("text", ""), target=target):
+                    return True
+        print(f"   [Playwright] '{target}' not found in active browser page; trying desktop/vision fallback...")
 
     if kind not in ("CLICK", "TYPE", "DRAG"):
         print(f"   Unsupported action: {kind}")
@@ -1025,10 +1088,14 @@ def run_action_pipeline(intent: Dict, base_image: Optional[Path], images_dir: Pa
             print(f"Step {i}/{len(steps)}: {step['action']} {step.get('target') or ''}".rstrip())
         image = base_image
         if execute and step["action"] in ("CLICK", "TYPE", "DRAG"):
-            image = _capture_live("live_screen.png")
-            if image is None:
-                print("[Error] Could not capture the screen; nothing was done.")
-                return False
+            # If Playwright is open, we can try DOM operations directly without requiring an X11 screen capture
+            if not (HAS_PLAYWRIGHT and playwright_bridge.is_browser_open()):
+                image = _capture_live("live_screen.png")
+                if image is None:
+                    print("[Error] Could not capture the screen; nothing was done.")
+                    return False
+            else:
+                image = _capture_live("live_screen.png")
         ok = _run_step(step, image, images_dir, execute, learn, interactive)
         if not ok:
             print("Stopped: that step failed.")
@@ -1190,6 +1257,7 @@ def main():
     print("  /list-templates  - List trained button templates")
     print("  /delete-template <name> - Delete a trained button template")
     print("  /context         - Show current page, recent actions and form state")
+    print("  /browser [info|close|read] - Control active Playwright browser session")
     print("  /clear-context   - Reset the context memory")
     print("  /test-action <q> - Classify a request without executing it")
     print("  /learn           - Toggle auto-learning (save successful targets as templates)")
@@ -1199,9 +1267,19 @@ def main():
     # Interactive REPL Loop
     while True:
         try:
-            label_name = selected_image.name if selected_image else "No Image"
+            if HAS_PLAYWRIGHT and playwright_bridge.is_browser_open():
+                title = playwright_bridge.get_bridge().current_title or "active"
+                if len(title) > 25:
+                    title = title[:22] + "..."
+                label_name = f"Browser: {title}"
+            elif selected_image:
+                label_name = selected_image.name
+            else:
+                label_name = "Vision Agent"
             user_input = input(f"[{label_name}] > ").strip()
         except (KeyboardInterrupt, EOFError):
+            if HAS_PLAYWRIGHT and playwright_bridge.is_browser_open():
+                playwright_bridge.close_browser()
             print("\nExiting. Goodbye!")
             break
 
@@ -1210,6 +1288,8 @@ def main():
 
         cmd = user_input.lower()
         if cmd in ["/exit", "exit", "/quit", "quit"]:
+            if HAS_PLAYWRIGHT and playwright_bridge.is_browser_open():
+                playwright_bridge.close_browser()
             print("Exiting. Goodbye!")
             break
 
@@ -1410,6 +1490,39 @@ def main():
                 print(f"Deleted template '{normalize_name(parts[1])}'.")
             else:
                 print(f"No template named '{parts[1]}'.")
+            continue
+
+        if cmd.startswith("/browser"):
+            parts = user_input.split(maxsplit=2)
+            subcmd = parts[1].lower() if len(parts) > 1 else "info"
+            if subcmd in ("info", "status"):
+                if HAS_PLAYWRIGHT and playwright_bridge.is_browser_open():
+                    b = playwright_bridge.get_bridge()
+                    print(f"Browser active: '{b.current_title}' [{b.current_url}]")
+                else:
+                    print("Browser is not currently open.")
+            elif subcmd == "close":
+                if HAS_PLAYWRIGHT and playwright_bridge.is_browser_open():
+                    playwright_bridge.close_browser()
+                    print("Browser closed.")
+                else:
+                    print("Browser is not currently open.")
+            elif subcmd == "read":
+                sel = parts[2].strip() if len(parts) > 2 else None
+                if HAS_PLAYWRIGHT and playwright_bridge.is_browser_open():
+                    txt = playwright_bridge.read_content(sel)
+                    print(txt if txt else "(no content)")
+                else:
+                    print("Browser is not currently open.")
+            else:
+                print("Usage: /browser [info | close | read <selector>]")
+            continue
+
+        # 1. Action Intent Check (Browser & Desktop automation)
+        intent = classify_intent(user_input) if HAS_ACTIONS else None
+        if intent is not None and intent["action"] != "UNKNOWN":
+            target_image = base_image if base_image else selected_image
+            run_action_pipeline(intent, target_image, images_dir, execute_mode, learn_mode)
             continue
 
         # Inference query

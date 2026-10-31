@@ -88,8 +88,8 @@ Integrate YOLO with ONNX Runtime for general icon and logo recognition.
 
 ---
 
-### Phase 3: Playwright Browser Bridge (NEW — NEXT)
-Replace screenshot-based browser interaction with direct browser engine control via Playwright / Chrome DevTools Protocol.
+### Phase 3: Playwright Browser Bridge (COMPLETED)
+Replaced screenshot-based browser interaction with direct browser engine control via Playwright / Chrome DevTools Protocol.
 
 **Why this replaces the old approach for browser tasks:**
 - Playwright talks to Chrome internally — it doesn't see or care about the screen
@@ -98,12 +98,20 @@ Replace screenshot-based browser interaction with direct browser engine control 
 - Uses ~50MB RAM instead of ~2.6GB for the vision pipeline
 - Element lookup is milliseconds, not 1.5-3.7 seconds
 
-**Tasks:**
-- Install Playwright on the Pi (`pip install playwright && playwright install chromium`)
-- Create a browser bridge module that accepts commands from the intent classifier
-- Implement core actions: navigate to URL, click element by text/role/label, type in fields, read page content
-- Integrate with existing intent classifier (NAVIGATE, CLICK, TYPE actions route here for browser targets)
-- Test with real use cases: open google.com, fill out a Google Form, check F1 standings
+**Implementation completed:**
+- Installed Playwright and Chromium build for Linux ARM64 (`playwright-1.64.1`)
+- Built `playwright_bridge.py` supporting:
+  - `navigate(url)` with URL normalization
+  - `click_element(target, kind)` with smart role/label/text/CSS locator matching
+  - `type_text(text, target, press_enter)` with clear-before-type and focus detection
+  - `press_key(key)` with keyboard mapping
+  - `scroll(direction, amount)` with mouse wheel deltas
+  - `read_content(selector)` and `read_table(selector)` for content extraction
+  - Headless/headed auto-detection based on DISPLAY
+- Connected Playwright bridge into `intent_classifier.py` and `action_executor.py`
+- Added `READ` action support and multi-step verb chaining ("type X in search and press enter")
+- Integrated into `vision_cli.py` and created interactive executable `./vision` / `agent.py`
+- Tested and verified with Google Search, Wikipedia F1 standings, and unit test suite
 
 **Expected Outcome:**
 - All browser automation handled through Playwright, not screenshots
@@ -245,13 +253,13 @@ Improve performance, accuracy, and reliability across the whole system.
 ## Next Steps
 1. Phase 1: Heuristic rules — COMPLETED (unsuccessful, icons not OCR'd as text)
 2. Phase 2: YOLO Icon Detection — COMPLETED (demoted to fallback)
-3. **Phase 3: Playwright Browser Bridge — NEXT**
-   - Install Playwright on the Pi
-   - Build browser bridge module
-   - Connect to intent classifier
-   - Test with real browser tasks (google.com, Google Forms, F1 standings)
-4. Phase 4: AT-SPI Desktop Automation — after Phase 3
-   - Install AT-SPI packages
+3. Phase 3: Playwright Browser Bridge — COMPLETED
+   - Installed Playwright & Chromium ARM64
+   - Built playwright_bridge.py
+   - Integrated with intent classifier and action pipeline
+   - Added interactive `./vision` CLI entrypoint
+4. **Phase 4: AT-SPI Desktop Automation — NEXT**
+   - Install AT-SPI packages (`python3-pyatspi`, `python3-gi`, `gir1.2-atspi-2.0`)
    - Test accessibility trees in a real desktop session
    - Complete atspi_bridge.py for full element finding + interaction
 5. Phase 5: Voice Input (Vosk) — after Phase 4

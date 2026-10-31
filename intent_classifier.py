@@ -13,7 +13,7 @@ Pure regex matching, so classification takes well under 1 ms. No model is loaded
 import re
 from typing import Dict, List, Optional, Tuple
 
-ACTIONS = ("CLICK", "TYPE", "NAVIGATE", "SCROLL", "DRAG", "WAIT", "MULTISTEP", "UNKNOWN")
+ACTIONS = ("CLICK", "TYPE", "NAVIGATE", "SCROLL", "DRAG", "WAIT", "READ", "MULTISTEP", "UNKNOWN")
 
 # Trailing element-type words are removed from the target and kept in params["kind"].
 _KIND_WORDS = ("button", "link", "icon", "tab")
@@ -32,10 +32,14 @@ _STEP_SPLIT = re.compile(
 _AND_SPLIT = re.compile(r"\s+and\s+", re.IGNORECASE)
 _ACTION_VERB = re.compile(
     r"^(?:please\s+)?(?:click|tap|press|hit|select|mark|type|enter|write|input|go|open|"
-    r"scroll|wait|drag|find|locate|navigate|visit)\b",
+    r"scroll|wait|drag|find|locate|navigate|visit|read|extract|show)\b",
     re.IGNORECASE,
 )
 
+_READ = re.compile(
+    r"^(?:please\s+)?(?:read|extract|show|get)\s*(?:the\s+)?(page|table|text|content|results?)?(?:\s+(?:from|in|on)\s+(.+))?$",
+    re.IGNORECASE,
+)
 _WAIT = re.compile(
     r"^(?:please\s+)?(?:wait|pause|sleep)(?:\s+for)?(?:\s+(\d+(?:\.\d+)?))?\s*"
     r"(ms|milliseconds?|s|secs?|seconds?)?\s*$",
@@ -100,19 +104,29 @@ def _looks_like_url(token: str) -> bool:
 
 
 def _split_steps(text: str) -> List[str]:
-    """Split 'click A then type B' into ['click A', 'type B']. Returns [text] when there is no split."""
-    parts = [p.strip() for p in _STEP_SPLIT.split(text) if p and p.strip()]
-    if len(parts) > 1:
-        return parts
-    # "click login and type bob": split on 'and' only when both sides start with an action verb.
-    pieces = [p.strip() for p in _AND_SPLIT.split(text) if p.strip()]
-    if len(pieces) == 2 and all(_ACTION_VERB.match(p) for p in pieces):
-        return pieces
-    return [text]
+    """Split 'click A then type B' or 'click A and type B' into individual action steps."""
+    raw_parts = [p.strip() for p in _STEP_SPLIT.split(text) if p and p.strip()]
+    if not raw_parts:
+        return [text]
+
+    results: List[str] = []
+    for part in raw_parts:
+        pieces = [p.strip() for p in _AND_SPLIT.split(part) if p.strip()]
+        if len(pieces) > 1 and all(_ACTION_VERB.match(p) for p in pieces):
+            results.extend(pieces)
+        else:
+            results.append(part)
+    return results if results else [text]
 
 
 def _classify_single(text: str) -> Dict:
     text = text.strip()
+
+    m = _READ.match(text)
+    if m:
+        target_kind = (m.group(1) or "page").lower()
+        selector = m.group(2)
+        return _result("READ", target=selector, params={"kind": target_kind})
 
     m = _WAIT.match(text)
     if m:
