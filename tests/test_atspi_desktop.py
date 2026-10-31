@@ -5,6 +5,7 @@ All tests run deterministically without requiring an active X11 desktop or D-Bus
 using mock accessible trees.
 """
 
+import time
 import unittest
 from unittest import mock
 from typing import List, Optional
@@ -216,6 +217,20 @@ class TestAtspiBridge(unittest.TestCase):
         self.assertIn("File", names)
         self.assertIn("Document Content", names)
 
+    def test_snapshot_caching_and_expiry(self):
+        snap1 = atspi_bridge.snapshot("Text Editor", interactive_only=False)
+        snap2 = atspi_bridge.snapshot("Text Editor", interactive_only=False)
+        self.assertTrue(snap2.get("cached", False))
+        self.assertEqual(snap1["snapshot_id"], snap2["snapshot_id"])
+
+        # Force fresh
+        snap3 = atspi_bridge.snapshot("Text Editor", interactive_only=False, force_fresh=True)
+        self.assertFalse(snap3.get("cached", False))
+
+        # Simulated expiration
+        with mock.patch("time.time", return_value=time.time() + 30.0):
+            self.assertIsNone(atspi_bridge.resolve_ref(snap1["elements"][0]["ref_id"]))
+
     def test_resolve_ref(self):
         snap = atspi_bridge.snapshot("Text Editor")
         save_elem = next(e for e in snap["elements"] if e["name"] == "Save")
@@ -231,6 +246,22 @@ class TestAtspiBridge(unittest.TestCase):
         self.assertIsNotNone(elem)
         self.assertEqual(elem["name"], "Save")
         self.assertEqual(elem["role"], "menuitem")
+
+    def test_ambiguity_handling(self):
+        # Create tree with duplicate element names in different windows
+        btn_a = MockAccessibleNode(name="Duplicate", role="pushbutton", bounds=(0, 0, 50, 50))
+        btn_b = MockAccessibleNode(name="Duplicate", role="pushbutton", bounds=(100, 100, 50, 50))
+        root = MockAccessibleNode(name="Desktop", role="desktop", children=[btn_a, btn_b])
+        atspi_bridge.set_mock_desktop(root)
+
+        # Non-strict returns first match
+        first = atspi_bridge.find_element_by_name("Duplicate", require_single=False)
+        self.assertIsNotNone(first)
+
+        # Strict raises ValueError with AMBIGUOUS_TARGET
+        with self.assertRaises(ValueError) as cm:
+            atspi_bridge.find_element_by_name("Duplicate", require_single=True)
+        self.assertIn("AMBIGUOUS_TARGET", str(cm.exception))
 
     def test_find_element_by_role(self):
         buttons = atspi_bridge.find_element_by_role("pushbutton")
@@ -249,6 +280,7 @@ class TestAtspiBridge(unittest.TestCase):
         doc_elem = next(e for e in snap["elements"] if e["name"] == "Document Content")
         ref_id = doc_elem["ref_id"]
 
+        self.assertTrue(atspi_bridge.is_editable(ref_id))
         ok = atspi_bridge.set_text_contents(ref_id, "New test text contents")
         self.assertTrue(ok)
 
@@ -261,6 +293,7 @@ class TestAtspiBridge(unittest.TestCase):
         save_elem = next(e for e in snap["elements"] if e["name"] == "Save")
         ref_id = save_elem["ref_id"]
 
+        self.assertFalse(atspi_bridge.is_editable(ref_id))
         ok = atspi_bridge.set_text_contents(ref_id, "Won't work")
         self.assertFalse(ok)
 
@@ -384,6 +417,13 @@ class TestAgentExecutionIntegration(unittest.TestCase):
     def test_agent_read_desktop_execution(self):
         ok = agent.execute_instruction("read Display in Calculator", execute=True)
         self.assertTrue(ok)
+
+    def test_safety_check_destructive_actions(self):
+        # Destructive actions require confirmation in interactive mode, guarded in non-interactive
+        with mock.patch("sys.stdin.isatty", return_value=True):
+            with mock.patch("builtins.input", return_value="n"):
+                ok = agent.execute_instruction("click close in Calculator", execute=True)
+                self.assertFalse(ok)
 
 
 if __name__ == "__main__":

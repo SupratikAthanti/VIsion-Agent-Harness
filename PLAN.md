@@ -137,14 +137,17 @@ Enable position-independent control of native desktop applications via the Linux
 - Completed `atspi_bridge.py` supporting:
   - App discovery (`list_apps()`) and window enumerations
   - Structured accessibility snapshotting (`snapshot(app_name)`, `snapshot_all()`)
-  - Qualified reference addressing (`@<snapshot_id>:e<N>`) and resolution
-  - Element searching by name, role, and text content
+  - Qualified reference addressing (`@<snapshot_id>:e<N>`) with TTL expiry (15s) and node mutation verification
+  - In-memory snapshot caching to prevent expensive redundant tree walks
+  - Element searching by name, role, and text content with duplicate detection (`AMBIGUOUS_TARGET`)
+  - Strict input validation: `is_editable()` checks prevent misdirected typing into arbitrary windows
   - Direct headless action invocation via `Atspi.Action` (`click`, `press`, `activate`, etc.)
   - Direct semantic text setting via `Atspi.EditableText` (`set_text_contents`, `insert_text`) without focus stealing
   - Accessible element state and text reading via `read_element`
   - Focus management via `Atspi.Component` (`grab_focus`)
   - Clean fallbacks to live bounding box clicks and typing via `xdotool`
   - Deterministic mock backend support (`set_mock_desktop()`) allowing 100% test pass rate in headless/CI environments
+  - Validated live against real GTK applications under Xvfb and D-Bus accessibility session
 - Updated `intent_classifier.py`:
   - Added app-scoping regex (`click File in VS Code`, `type hello in Notes`)
   - Added snapshot/ref actions (`LIST_APPS`, `SNAPSHOT`, `FOCUS`, `READ`)

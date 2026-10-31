@@ -2,8 +2,10 @@
 
 Provides position-independent desktop control modeled after OS accessibility trees:
 - Inspect applications and accessibility trees (`list_apps`, `snapshot`, `snapshot_all`)
-- Qualified snapshot references: `@<snapshot_id>:e<N>`
-- Find elements by name, role, text content, and state
+- Qualified snapshot references: `@<snapshot_id>:e<N>` with TTL expiry & validation
+- Cached snapshots with configurable TTL to avoid expensive tree walks
+- Ambiguity detection returning AMBIGUOUS_TARGET with candidate lists
+- Strict verification before actions to prevent acting on wrong or non-editable nodes
 - Direct AT-SPI Action execution (`click`, `press`, `activate`, etc.)
 - Direct AT-SPI EditableText setting (`set_text_contents`, `insert_text`)
 - Element reading (accessible name, role, state, text content, value)
@@ -28,9 +30,14 @@ for dist_path in ("/usr/lib/python3/dist-packages", "/usr/local/lib/python3/dist
 MAX_TREE_DEPTH = 30
 MAX_TREE_ELEMENTS = 10000
 
-# Snapshot storage: snapshot_id -> Dict mapping ref_id -> Dict
+# Snapshot cache configuration
+SNAPSHOT_TTL_SECONDS = 15.0  # snapshots expire after 15 seconds to prevent stale refs
+
+# Snapshot storage: snapshot_id -> Dict metadata with 'created_at', 'app', 'elements_map'
 _SNAPSHOTS: Dict[str, Dict[str, Any]] = {}
 _LAST_SNAPSHOT_ID: Optional[str] = None
+# Cache of recent snapshots keyed by app_name / None: (snapshot_id, timestamp)
+_SNAPSHOT_CACHE_INDEX: Dict[Optional[str], str] = {}
 
 # Custom test mock desktop provider (for deterministic tests)
 _MOCK_DESKTOP: Optional[Any] = None
@@ -40,12 +47,30 @@ def set_mock_desktop(mock_desktop: Optional[Any]) -> None:
     """Set a mock desktop tree provider for testing without a live GUI or D-Bus session."""
     global _MOCK_DESKTOP
     _MOCK_DESKTOP = mock_desktop
+    invalidate_snapshots()
     _backend.cache_clear()
 
 
 def get_mock_desktop() -> Optional[Any]:
     """Return the active mock desktop, if set."""
     return _MOCK_DESKTOP
+
+
+def invalidate_snapshots(app_name: Optional[str] = None) -> None:
+    """Invalidate all cached snapshots, or snapshots for a specific application."""
+    global _LAST_SNAPSHOT_ID, _SNAPSHOTS, _SNAPSHOT_CACHE_INDEX
+    if app_name is None:
+        _SNAPSHOTS.clear()
+        _SNAPSHOT_CACHE_INDEX.clear()
+        _LAST_SNAPSHOT_ID = None
+    else:
+        norm = _normalize(app_name)
+        to_del = [sid for sid, meta in _SNAPSHOTS.items() if _normalize(meta.get("app", "")) == norm]
+        for sid in to_del:
+            _SNAPSHOTS.pop(sid, None)
+        _SNAPSHOT_CACHE_INDEX.pop(app_name, None)
+        if _LAST_SNAPSHOT_ID in to_del:
+            _LAST_SNAPSHOT_ID = None
 
 
 @lru_cache(maxsize=1)
@@ -150,7 +175,6 @@ def _states(accessible, backend) -> List[str]:
             for s in state_set.get_states():
                 states.append(str(s).lower())
         else:
-            # Check common states by name
             for sname in ("FOCUSED", "SHOWING", "VISIBLE", "ENABLED", "CHECKED", "EDITABLE", "ACTIVE"):
                 st_attr = getattr(backend[0].StateType, sname, None) if backend[1] == "gi" else getattr(backend[0], f"STATE_{sname}", None)
                 if st_attr is not None and state_set.contains(st_attr):
@@ -163,16 +187,36 @@ def _states(accessible, backend) -> List[str]:
 def _text_content(accessible) -> Optional[str]:
     """Retrieve text content via AtspiText interface if supported."""
     try:
-        if hasattr(accessible, "get_text"):
-            # Check if this is an AtspiText interface or direct mock
+        # In PyGObject Atspi, Atspi.Text interface functions are called as Atspi.Text.get_text(accessible, start, end)
+        backend = _backend()
+        if backend and backend[1] == "gi":
+            Atspi = backend[0]
+            if hasattr(Atspi, "Text") and hasattr(Atspi.Text, "get_text"):
+                try:
+                    count = Atspi.Text.get_character_count(accessible)
+                    if count >= 0:
+                        return str(Atspi.Text.get_text(accessible, 0, -1) or "")
+                except Exception:
+                    pass
+
+        # pyatspi or mock accessible
+        if hasattr(accessible, "queryText"):
             try:
-                return str(accessible.get_text(0, -1) or "")
+                ti = accessible.queryText()
+                if ti:
+                    return str(ti.getText(0, -1) or "")
+            except Exception:
+                pass
+
+        if hasattr(accessible, "get_text"):
+            try:
+                val = accessible.get_text(0, -1)
+                if val is not None and not str(val).startswith("<Atspi."):
+                    return str(val)
             except TypeError:
-                return str(accessible.get_text() or "")
-        text_iface = getattr(accessible, "get_text_iface", None) or getattr(accessible, "queryText", None)
-        if text_iface:
-            ti = text_iface()
-            return str(ti.get_text(0, -1) or "")
+                val = accessible.get_text()
+                if val is not None and not str(val).startswith("<Atspi."):
+                    return str(val)
     except Exception:
         pass
     return None
@@ -349,7 +393,6 @@ def list_apps() -> List[Dict[str, Any]]:
                 continue
             name = _name(app)
             role = _role(app)
-            # Find window titles under this app
             window_titles = []
             win_count = _child_count(app)
             for w in range(win_count):
@@ -370,13 +413,14 @@ def list_apps() -> List[Dict[str, Any]]:
         return []
 
 
-def snapshot(app_name: Optional[str] = None, interactive_only: bool = True) -> Dict[str, Any]:
+def snapshot(app_name: Optional[str] = None, interactive_only: bool = True, force_fresh: bool = False) -> Dict[str, Any]:
     """
     Take an accessibility snapshot of an app (or all apps).
-    Assigns stable qualified refs: `@<snapshot_id>:e<N>`.
-    Returns a structured envelope with tree and metadata.
+    Assigns stable qualified refs: `@<snapshot_id>:e<N>` with TTL expiry.
+    If a fresh snapshot was taken recently for the same app target and force_fresh=False,
+    the cached snapshot envelope is returned to prevent slow, redundant tree walks.
     """
-    global _LAST_SNAPSHOT_ID
+    global _LAST_SNAPSHOT_ID, _SNAPSHOTS, _SNAPSHOT_CACHE_INDEX
     backend = _backend()
     if backend is None:
         return {
@@ -385,11 +429,27 @@ def snapshot(app_name: Optional[str] = None, interactive_only: bool = True) -> D
             "data": {},
         }
 
+    now = time.time()
+
+    # Check cached snapshot
+    cache_key = _normalize(app_name) if app_name else None
+    if not force_fresh and cache_key in _SNAPSHOT_CACHE_INDEX:
+        cached_id = _SNAPSHOT_CACHE_INDEX[cache_key]
+        cached_meta = _SNAPSHOTS.get(cached_id)
+        if cached_meta and (now - cached_meta["created_at"]) < SNAPSHOT_TTL_SECONDS:
+            return {
+                "ok": True,
+                "snapshot_id": cached_id,
+                "app": cached_meta["app"],
+                "ref_count": len(cached_meta["elements_map"]),
+                "elements": cached_meta["public_elements"],
+                "cached": True,
+            }
+
     snapshot_id = "s" + uuid.uuid4().hex[:8]
     root = _desktop(backend)
     target_path = ""
 
-    # If app_name given, find that specific application node
     app_info = {"name": app_name or "Desktop", "role": "desktop"}
     if app_name:
         normalized_target = _normalize(app_name)
@@ -417,7 +477,7 @@ def snapshot(app_name: Optional[str] = None, interactive_only: bool = True) -> D
     raw_elements = list(_walk_tree(root, backend, target_path, 0, [0], interactive_only=interactive_only))
 
     elements_map: Dict[str, Any] = {}
-    tree_items: List[Dict[str, Any]] = []
+    public_items: List[Dict[str, Any]] = []
 
     for idx, elem in enumerate(raw_elements, 1):
         ref_id = f"@{snapshot_id}:e{idx}"
@@ -435,57 +495,86 @@ def snapshot(app_name: Optional[str] = None, interactive_only: bool = True) -> D
             "_accessible": elem["raw_accessible"],
         }
         elements_map[ref_id] = elem_data
-        # Public item without private _accessible
         public_item = {k: v for k, v in elem_data.items() if not k.startswith("_")}
-        tree_items.append(public_item)
+        public_items.append(public_item)
 
-    _SNAPSHOTS[snapshot_id] = elements_map
+    _SNAPSHOTS[snapshot_id] = {
+        "created_at": now,
+        "app": app_info["name"],
+        "elements_map": elements_map,
+        "public_elements": public_items,
+    }
     _LAST_SNAPSHOT_ID = snapshot_id
+    _SNAPSHOT_CACHE_INDEX[cache_key] = snapshot_id
 
-    # Keep snapshot cache bounded
-    if len(_SNAPSHOTS) > 20:
-        oldest_id = next(iter(_SNAPSHOTS))
-        del _SNAPSHOTS[oldest_id]
+    # Clean up expired snapshots
+    expired = [sid for sid, meta in _SNAPSHOTS.items() if (now - meta["created_at"]) > SNAPSHOT_TTL_SECONDS * 2]
+    for sid in expired:
+        _SNAPSHOTS.pop(sid, None)
 
     return {
         "ok": True,
         "snapshot_id": snapshot_id,
         "app": app_info["name"],
         "ref_count": len(elements_map),
-        "elements": tree_items,
+        "elements": public_items,
     }
 
 
-def snapshot_all(interactive_only: bool = True) -> Dict[str, Any]:
+def snapshot_all(interactive_only: bool = True, force_fresh: bool = False) -> Dict[str, Any]:
     """Capture snapshot across all running desktop applications."""
-    return snapshot(app_name=None, interactive_only=interactive_only)
+    return snapshot(app_name=None, interactive_only=interactive_only, force_fresh=force_fresh)
 
 
 def resolve_ref(ref: str) -> Optional[Dict[str, Any]]:
-    """Resolve a qualified ref `@<snapshot_id>:e<N>` or bare `e<N>` to its element data."""
+    """
+    Resolve a qualified ref `@<snapshot_id>:e<N>` or bare `e<N>` to its element data.
+    Validates snapshot TTL expiry and node liveness. Returns None if stale or expired.
+    """
     ref = ref.strip()
     if not ref:
         return None
 
+    now = time.time()
+    snapshot_id = None
+    target_ref = ref
+
     if ref.startswith("@") and ":" in ref:
-        snapshot_id, ref_num = ref[1:].split(":", 1)
-        snap = _SNAPSHOTS.get(snapshot_id)
-        if snap:
-            return snap.get(ref)
+        snapshot_id = ref[1:].split(":", 1)[0]
+    elif _LAST_SNAPSHOT_ID:
+        snapshot_id = _LAST_SNAPSHOT_ID
+        bare = ref.lstrip("@")
+        target_ref = f"@{snapshot_id}:{bare}"
+    else:
         return None
 
-    # If bare @e8 or e8, use last snapshot if available
-    if _LAST_SNAPSHOT_ID and _LAST_SNAPSHOT_ID in _SNAPSHOTS:
-        snap = _SNAPSHOTS[_LAST_SNAPSHOT_ID]
-        bare = ref.lstrip("@")
-        qualified = f"@{_LAST_SNAPSHOT_ID}:{bare}"
-        return snap.get(qualified)
+    meta = _SNAPSHOTS.get(snapshot_id)
+    if not meta:
+        return None
 
-    return None
+    # Check TTL expiry
+    if (now - meta["created_at"]) > SNAPSHOT_TTL_SECONDS:
+        return None
+
+    elem = meta["elements_map"].get(target_ref)
+    if not elem:
+        return None
+
+    # Verify element liveness: ensure node name/role still match
+    acc = elem.get("_accessible")
+    if acc is not None:
+        try:
+            live_role = _role(acc)
+            if live_role and elem.get("role") and _normalize(live_role) != _normalize(elem["role"]):
+                return None  # Node mutated or was replaced
+        except Exception:
+            return None
+
+    return elem
 
 
 # ---------------------------------------------------------------------------
-# Element Lookup by Semantic Attributes
+# Element Lookup by Semantic Attributes & Ambiguity Detection
 # ---------------------------------------------------------------------------
 
 def find_elements(
@@ -494,12 +583,13 @@ def find_elements(
     text: Optional[str] = None,
     app_name: Optional[str] = None,
     exact: bool = False,
+    force_fresh: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     Find matching accessible elements by name, role, or text content.
-    Takes a fresh snapshot if none exists or app_name is specified.
+    Uses cached snapshot if available within TTL, unless force_fresh=True.
     """
-    snap_result = snapshot(app_name=app_name, interactive_only=False)
+    snap_result = snapshot(app_name=app_name, interactive_only=False, force_fresh=force_fresh)
     if not snap_result.get("ok"):
         return []
 
@@ -538,8 +628,13 @@ def find_elements(
     return matches
 
 
-def find_element_by_name(name: str, app_name: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    """Find an element by name (exact actionable match preferred, then exact, then substring)."""
+def find_element_by_name(name: str, app_name: Optional[str] = None,
+                         require_single: bool = False) -> Optional[Dict[str, Any]]:
+    """
+    Find an element by name (exact actionable match preferred, then exact, then substring).
+    Raises ValueError('AMBIGUOUS_TARGET') if require_single is True and multiple distinct matches exist.
+    Returns None if no matching element was found.
+    """
     norm_query = _normalize(name)
     if len(norm_query) < 2:
         return None
@@ -548,24 +643,22 @@ def find_element_by_name(name: str, app_name: Optional[str] = None) -> Optional[
     exact = [e for e in elements if _normalize(e.get("name", "")) == norm_query]
     actionable_roles = ("button", "menuitem", "link", "tab", "pushbutton", "togglebutton", "entry")
     exact_actionable = [e for e in exact if any(r in _normalize(e.get("role", "")) for r in actionable_roles)]
-    if exact_actionable:
-        return exact_actionable[0]
-    if exact:
-        return exact[0]
 
-    partial = [e for e in elements if norm_query in _normalize(e.get("name", ""))]
-    if partial:
-        # Prefer bounded elements
-        bounded = [e for e in partial if e.get("bounds")]
-        return bounded[0] if bounded else partial[0]
+    target_pool = exact_actionable or exact
+    if not target_pool:
+        target_pool = [e for e in elements if norm_query in _normalize(e.get("name", ""))]
+    if not target_pool:
+        target_pool = [e for e in elements if norm_query in _normalize(e.get("text", "") or "")]
 
-    # Try matching text content
-    text_matches = [e for e in elements if norm_query in _normalize(e.get("text", "") or "")]
-    if text_matches:
-        bounded = [e for e in text_matches if e.get("bounds")]
-        return bounded[0] if bounded else text_matches[0]
+    if not target_pool:
+        return None
 
-    return None
+    if require_single and len(target_pool) > 1:
+        distinct = {e.get("ref_id"): e for e in target_pool}
+        if len(distinct) > 1:
+            raise ValueError(f"AMBIGUOUS_TARGET: {len(distinct)} elements match '{name}'")
+
+    return target_pool[0]
 
 
 def find_element_by_role(role: str, app_name: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -598,12 +691,11 @@ def _get_element_accessible(elem_or_ref: Union[str, Dict[str, Any]]) -> Tuple[Op
         return None, elem_or_ref
 
     if isinstance(elem_or_ref, str):
-        # Check if ref or path
         if elem_or_ref.startswith("@") or ":" in elem_or_ref:
             resolved = resolve_ref(elem_or_ref)
             if resolved:
                 return resolved.get("_accessible"), resolved
-        # Otherwise treat as path or element name
+            return None, None  # Stale ref expired or not found
         if "/" in elem_or_ref or elem_or_ref.isdigit():
             acc = _resolve_path(elem_or_ref, backend)
             return acc, {"ref_path": elem_or_ref}
@@ -612,6 +704,26 @@ def _get_element_accessible(elem_or_ref: Union[str, Dict[str, Any]]) -> Tuple[Op
             return _get_element_accessible(found)
 
     return None, None
+
+
+def is_editable(elem_or_ref: Union[str, Dict[str, Any]]) -> bool:
+    """Return True only if the element is verified to be an editable input field."""
+    accessible, elem = _get_element_accessible(elem_or_ref)
+    if accessible is None:
+        return False
+    backend = _backend()
+    states = _states(accessible, backend) if backend else []
+    if "editable" in states:
+        return True
+    # If using mock accessible, check if set_text_contents actually succeeds
+    if backend and backend[1] == "mock":
+        return "editable" in states
+    try:
+        if getattr(accessible, "get_editable_text_iface", None) or getattr(accessible, "queryEditableText", None):
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def click_element(elem_or_ref: Union[str, Dict[str, Any]]) -> bool:
@@ -624,7 +736,7 @@ def click_element(elem_or_ref: Union[str, Dict[str, Any]]) -> bool:
         return False
 
     try:
-        accessible = _resolve_ref(elem_or_ref, backend) if isinstance(elem_or_ref, str) else None
+        accessible = _resolve_ref(elem_or_ref, backend) if isinstance(elem_or_ref, str) and not elem_or_ref.startswith("@") else None
     except Exception:
         accessible = None
 
@@ -686,7 +798,6 @@ def set_text_contents(elem_or_ref: Union[str, Dict[str, Any]], text: str) -> boo
             editable = accessible.queryEditableText()
             return bool(editable.setTextContents(text))
     except Exception:
-        # Try insert_text fallback
         try:
             if backend[1] == "gi":
                 editable = accessible.get_editable_text_iface()

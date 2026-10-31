@@ -29,11 +29,26 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+import re
 from intent_classifier import classify_intent, route_context, is_ref
 import context_memory
 import playwright_bridge
 import action_executor
 import atspi_bridge
+
+# Sensitive or destructive action patterns requiring safety checks
+SENSITIVE_ACTIONS_PATTERN = re.compile(
+    r"\b(delete|remove|close|quit|kill|terminate|shutdown|reboot|restart|poweroff|format|reset|wipe|destroy)\b",
+    re.IGNORECASE,
+)
+
+
+def is_sensitive_action(step: Dict) -> bool:
+    """Return True if the instruction targets a potentially destructive action."""
+    target = step.get("target") or ""
+    text = (step.get("params") or {}).get("text") or ""
+    combined = f"{target} {text}"
+    return bool(SENSITIVE_ACTIONS_PATTERN.search(combined))
 
 
 def _print_banner(execute: bool, headless: bool):
@@ -80,6 +95,21 @@ def execute_instruction(instruction: str, execute: bool = True) -> bool:
         if len(steps) > 1:
             step_target = f" '{step['target']}'" if step.get("target") else ""
             print(f"\n[Step {idx}/{len(steps)}] {step['action']}{step_target}")
+
+        # Safety confirmation for destructive actions in live interactive mode
+        if execute and is_sensitive_action(step):
+            target_desc = step.get('target') or 'this target'
+            if sys.stdin.isatty():
+                try:
+                    conf = input(f"   [Safety Alert] '{step['action']} {target_desc}' may be destructive. Confirm execution? (y/N): ").strip().lower()
+                    if conf not in ("y", "yes"):
+                        print("   Action aborted by user.")
+                        return False
+                except (KeyboardInterrupt, EOFError):
+                    print("\n   Action cancelled.")
+                    return False
+            else:
+                print(f"   [Safety Guard] Executing sensitive action: {step['action']} '{target_desc}'")
 
         ok = _execute_single_step(step, execute)
         if not ok:
@@ -247,20 +277,32 @@ def _execute_single_step(step: Dict, execute: bool) -> bool:
 
         # Desktop route (AT-SPI primary)
         if route == "desktop" or is_ref(target) or app:
-            elem = atspi_bridge.find_element_by_name(target, app_name=app) if (target and not is_ref(target)) else None
+            try:
+                elem = atspi_bridge.find_element_by_name(target, app_name=app, require_single=True) if (target and not is_ref(target)) else None
+            except ValueError as e:
+                print(f"   [Error] {e}. Specify the app or use a qualified ref.")
+                return False
+
             ref_or_target = elem.get("ref_id") if elem else target
             if ref_or_target:
+                # Strict verification: verify field is editable before modifying
+                if not atspi_bridge.is_editable(ref_or_target):
+                    print(f"   [Error] Target '{target}' is not an editable field. Aborting to prevent misdirected typing.")
+                    return False
+
                 # Direct AT-SPI EditableText
                 if atspi_bridge.set_text_contents(ref_or_target, typed_text):
                     print(f"   Typed {typed_text!r} into '{target}' via AT-SPI editable text.")
                     return True
-                # Focus then xdotool typing
+                # Verified editable but direct API failed: focus then xdotool typing
                 atspi_bridge.grab_focus(ref_or_target)
-                if action_executor.type_text(typed_text):
+                if action_executor.type_text(typed_text, accessible_ref=ref_or_target):
                     print(f"   Typed {typed_text!r} into '{target}' via focused input.")
                     return True
+                return False
 
-            print(f"   Could not find desktop field '{target}'. Trying fallback...")
+            print(f"   Could not find desktop field '{target}'.")
+            return False
 
         # Browser route (Playwright primary)
         if playwright_bridge.is_browser_open():
@@ -268,7 +310,12 @@ def _execute_single_step(step: Dict, execute: bool) -> bool:
             if ok:
                 return True
 
-        # General desktop fallback
+        # If a specific target was requested, do not type blindly into active window
+        if target:
+            print(f"   [Error] Specific field '{target}' could not be resolved. Aborting typing.")
+            return False
+
+        # General active focus typing only if no target was specified
         return action_executor.type_text(typed_text)
 
     if action == "CLICK":
@@ -282,21 +329,27 @@ def _execute_single_step(step: Dict, execute: bool) -> bool:
 
         # Desktop route (AT-SPI primary)
         if route == "desktop" or is_ref(target) or app:
-            elem = atspi_bridge.find_element_by_name(target, app_name=app) if (target and not is_ref(target)) else None
+            try:
+                elem = atspi_bridge.find_element_by_name(target, app_name=app, require_single=True) if (target and not is_ref(target)) else None
+            except ValueError as e:
+                print(f"   [Error] {e}. Specify the app or use a qualified ref.")
+                return False
+
             ref_or_target = elem.get("ref_id") if elem else target
-            if ref_or_target and atspi_bridge.click_element(ref_or_target):
-                print(f"   Clicked '{target}' via AT-SPI desktop action.")
-                return True
-            # Try bounding box click via xdotool if action invocation failed
-            bounds = atspi_bridge.get_element_bounds(ref_or_target) if ref_or_target else None
-            if bounds:
-                screen = action_executor.get_screen_size()
-                if screen:
-                    x_pct = (bounds[0] + bounds[2] / 2) / screen[0]
-                    y_pct = (bounds[1] + bounds[3] / 2) / screen[1]
-                    if action_executor.click_at(x_pct, y_pct, use_atspi_action=False):
-                        print(f"   Clicked '{target}' at live desktop coordinates.")
-                        return True
+            if ref_or_target:
+                if atspi_bridge.click_element(ref_or_target):
+                    print(f"   Clicked '{target}' via AT-SPI desktop action.")
+                    return True
+                # Try bounding box click via xdotool if action invocation failed
+                bounds = atspi_bridge.get_element_bounds(ref_or_target)
+                if bounds:
+                    screen = action_executor.get_screen_size()
+                    if screen:
+                        x_pct = (bounds[0] + bounds[2] / 2) / screen[0]
+                        y_pct = (bounds[1] + bounds[3] / 2) / screen[1]
+                        if action_executor.click_at(x_pct, y_pct, use_atspi_action=False):
+                            print(f"   Clicked '{target}' at live desktop coordinates.")
+                            return True
 
         # Browser route (Playwright primary)
         if playwright_bridge.is_browser_open():
@@ -306,7 +359,10 @@ def _execute_single_step(step: Dict, execute: bool) -> bool:
 
         # Desktop fallback if routed to browser but failed
         if route != "desktop" and atspi_bridge.is_at_spi_available():
-            elem = atspi_bridge.find_element_by_name(target, app_name=app)
+            try:
+                elem = atspi_bridge.find_element_by_name(target, app_name=app, require_single=True)
+            except ValueError:
+                elem = None
             if elem and atspi_bridge.click_element(elem.get("ref_id") or target):
                 print(f"   Clicked '{target}' via AT-SPI fallback.")
                 return True

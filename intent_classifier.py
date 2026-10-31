@@ -307,54 +307,68 @@ _BROWSER_KEYWORDS = {
 }
 
 
+# Desktop system / application menus that should never be silently routed to a web page
+_DESKTOP_OS_TERMS = {
+    "file", "edit", "view", "window", "help", "terminal", "preferences", "settings",
+    "save", "save as", "quit", "exit", "minimise", "minimize", "maximize", "close"
+}
+
+
 def route_context(intent: Dict, active_context: Optional[Dict] = None) -> str:
     """
     Route an intent to 'browser', 'desktop', or 'vision'.
 
-    Routing Policy:
-    1. Explicit browser target:
-       - Action is NAVIGATE to a URL
-       - Target or params explicitly mention URL, web page, or browser context
-       -> 'browser'
-    2. Explicit desktop target:
-       - Ref format (@s...:e...)
-       - Target or params specify an app ('in VS Code', 'in Notes', 'in Terminal')
+    Hardened Routing Policy:
+    1. Explicit desktop identifiers:
+       - Ref format (@s...:e..., @e..., e...)
        - Action is LIST_APPS, SNAPSHOT, FOCUS
+       - Target or params specify a non-browser app ('in VS Code', 'in Notes')
+       - Target is an OS system/desktop menu bar item ('File', 'Edit', 'Preferences')
        -> 'desktop'
-    3. No explicit target:
-       - Active focused context:
-         if focused app is a browser, route to 'browser'
-         if focused app is desktop app, route to 'desktop'
-       - Default to 'desktop' if AT-SPI is available, otherwise 'browser' if browser is open,
-         otherwise 'vision'
+    2. Explicit browser identifiers:
+       - Action is NAVIGATE to a URL
+       - Target or URL explicitly mentions web page, URL, or browser terms
+       - App parameter is explicitly a browser ('in Chrome', 'in Firefox')
+       -> 'browser'
+    3. Context-based routing:
+       - If focused application context is known:
+         If focused app is a browser -> 'browser'
+         If focused app is a native desktop app -> 'desktop'
+       - If browser is currently open and element is not an OS desktop menu -> 'browser'
+       - Default to 'desktop'
     """
     action = intent.get("action")
-    target = intent.get("target") or ""
+    target = (intent.get("target") or "").strip()
+    target_lower = target.lower()
     params = intent.get("params") or {}
-    app = params.get("app")
+    app = (params.get("app") or "").strip()
+    app_lower = app.lower()
 
-    # 1. Desktop-specific actions
+    # 1. Desktop-specific actions and refs
     if action in ("LIST_APPS", "SNAPSHOT", "FOCUS"):
         return "desktop"
 
     if is_ref(target):
         return "desktop"
 
+    # 2. Explicit app targeting
     if app:
-        # Check if the app name is explicitly a browser
-        if app.lower() in ("chrome", "chromium", "firefox", "browser"):
+        if any(b in app_lower for b in ("chrome", "chromium", "firefox", "browser", "playwright")):
             return "browser"
         return "desktop"
 
-    # 2. Browser-specific actions / targets
+    # 3. Known desktop OS menu items
+    if target_lower in _DESKTOP_OS_TERMS:
+        return "desktop"
+
+    # 4. Explicit browser navigation or keywords
     if action == "NAVIGATE" and params.get("url"):
         return "browser"
 
-    target_lower = target.lower()
     if any(k in target_lower for k in _BROWSER_KEYWORDS) or _looks_like_url(target):
         return "browser"
 
-    # 3. Context-based routing
+    # 5. Authoritative focus context
     ctx = active_context or {}
     focused_app = (ctx.get("focused_app") or ctx.get("current_app") or "").lower()
     browser_open = ctx.get("browser_open", False)
@@ -364,11 +378,8 @@ def route_context(intent: Dict, active_context: Optional[Dict] = None) -> str:
             return "browser"
         return "desktop"
 
-    # If browser is currently open and has active page, default web-style interactions there
+    # 6. Fallback based on open status
     if browser_open:
-        # If query has desktop-like verbs or OS menus like "File", "Edit", "Terminal"
-        if target in ("File", "Edit", "View", "Terminal", "Settings", "Save", "Close"):
-            return "desktop"
         return "browser"
 
     return "desktop"
