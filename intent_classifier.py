@@ -314,28 +314,30 @@ _DESKTOP_OS_TERMS = {
 }
 
 
-def route_context(intent: Dict, active_context: Optional[Dict] = None) -> str:
+def route_context(intent: Dict, active_context: Optional[Dict] = None) -> Tuple[str, Optional[str]]:
     """
-    Route an intent to 'browser', 'desktop', or 'vision'.
+    Route an intent to 'browser', 'desktop', or 'vision', returning (route, clarification_required).
 
-    Hardened Routing Policy:
+    Authoritative Routing Policy:
     1. Explicit desktop identifiers:
        - Ref format (@s...:e..., @e..., e...)
        - Action is LIST_APPS, SNAPSHOT, FOCUS
        - Target or params specify a non-browser app ('in VS Code', 'in Notes')
        - Target is an OS system/desktop menu bar item ('File', 'Edit', 'Preferences')
-       -> 'desktop'
+       -> ('desktop', None)
     2. Explicit browser identifiers:
        - Action is NAVIGATE to a URL
        - Target or URL explicitly mentions web page, URL, or browser terms
        - App parameter is explicitly a browser ('in Chrome', 'in Firefox')
-       -> 'browser'
-    3. Context-based routing:
-       - If focused application context is known:
-         If focused app is a browser -> 'browser'
-         If focused app is a native desktop app -> 'desktop'
-       - If browser is currently open and element is not an OS desktop menu -> 'browser'
-       - Default to 'desktop'
+       -> ('browser', None)
+    3. Authoritative active window / focus verification:
+       - If authoritative focused application context is known:
+         If focused app is a browser -> ('browser', None)
+         If focused app is a native desktop app -> ('desktop', None)
+    4. Ambiguity detection:
+       - If both browser and desktop apps are active and the target is generic without an app scope,
+         returns ('ambiguous', clarification_prompt) to prevent silent misrouted execution.
+       - Otherwise defaults safely to ('desktop', None) if AT-SPI available, else ('browser', None).
     """
     action = intent.get("action")
     target = (intent.get("target") or "").strip()
@@ -346,40 +348,43 @@ def route_context(intent: Dict, active_context: Optional[Dict] = None) -> str:
 
     # 1. Desktop-specific actions and refs
     if action in ("LIST_APPS", "SNAPSHOT", "FOCUS"):
-        return "desktop"
+        return "desktop", None
 
     if is_ref(target):
-        return "desktop"
+        return "desktop", None
 
     # 2. Explicit app targeting
     if app:
         if any(b in app_lower for b in ("chrome", "chromium", "firefox", "browser", "playwright")):
-            return "browser"
-        return "desktop"
+            return "browser", None
+        return "desktop", None
 
     # 3. Known desktop OS menu items
     if target_lower in _DESKTOP_OS_TERMS:
-        return "desktop"
+        return "desktop", None
 
     # 4. Explicit browser navigation or keywords
     if action == "NAVIGATE" and params.get("url"):
-        return "browser"
+        return "browser", None
 
     if any(k in target_lower for k in _BROWSER_KEYWORDS) or _looks_like_url(target):
-        return "browser"
+        return "browser", None
 
     # 5. Authoritative focus context
     ctx = active_context or {}
-    focused_app = (ctx.get("focused_app") or ctx.get("current_app") or "").lower()
+    focused_app = (ctx.get("focused_app") or ctx.get("current_app") or "").strip().lower()
     browser_open = ctx.get("browser_open", False)
 
     if focused_app:
         if any(b in focused_app for b in ("chrome", "chromium", "firefox", "browser")):
-            return "browser"
-        return "desktop"
+            return "browser", None
+        return "desktop", None
 
-    # 6. Fallback based on open status
+    # 6. Ambiguity check: if browser is open and query is generic, ask for clarification
+    if browser_open and target and not any(k in target_lower for k in _BROWSER_KEYWORDS):
+        return "ambiguous", f"Target '{target}' is ambiguous between the active browser and desktop apps. Specify an app (e.g. '{action.lower()} {target} in <App>') or a URL."
+
     if browser_open:
-        return "browser"
+        return "browser", None
 
-    return "desktop"
+    return "desktop", None

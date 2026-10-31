@@ -359,30 +359,33 @@ class TestRoutingAndIntent(unittest.TestCase):
     def test_routing_decisions(self):
         # 1. Explicit browser task
         nav_intent = classify_intent("open google.com")
-        self.assertEqual(route_context(nav_intent), "browser")
+        self.assertEqual(route_context(nav_intent)[0], "browser")
 
         search_intent = classify_intent("click Images on the web page")
-        self.assertEqual(route_context(search_intent), "browser")
+        self.assertEqual(route_context(search_intent)[0], "browser")
 
         # 2. Explicit desktop task
         desktop_ref_intent = classify_intent("click @s12345678:e3")
-        self.assertEqual(route_context(desktop_ref_intent), "desktop")
+        self.assertEqual(route_context(desktop_ref_intent)[0], "desktop")
 
         app_scope_intent = classify_intent("click File in VS Code")
-        self.assertEqual(route_context(app_scope_intent), "desktop")
+        self.assertEqual(route_context(app_scope_intent)[0], "desktop")
 
         apps_intent = classify_intent("list apps")
-        self.assertEqual(route_context(apps_intent), "desktop")
+        self.assertEqual(route_context(apps_intent)[0], "desktop")
 
         # 3. Disambiguation with active context
         click_file = classify_intent("click File")
         # Even if browser is open, "File" is desktop OS menu
-        self.assertEqual(route_context(click_file, {"browser_open": True}), "desktop")
+        self.assertEqual(route_context(click_file, {"browser_open": True})[0], "desktop")
 
         # Web-like action when browser is focused
         click_submit = classify_intent("click Submit")
-        self.assertEqual(route_context(click_submit, {"browser_open": True}), "browser")
-        self.assertEqual(route_context(click_submit, {"focused_app": "Text Editor"}), "desktop")
+        self.assertEqual(route_context(click_submit, {"focused_app": "Chrome"})[0], "browser")
+        self.assertEqual(route_context(click_submit, {"focused_app": "Text Editor"})[0], "desktop")
+
+        # Ambiguous when browser is open but target has no explicit app scope or web keyword
+        self.assertEqual(route_context(click_submit, {"browser_open": True})[0], "ambiguous")
 
 
 class TestAgentExecutionIntegration(unittest.TestCase):

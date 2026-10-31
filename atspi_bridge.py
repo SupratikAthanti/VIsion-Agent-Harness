@@ -296,6 +296,25 @@ def is_at_spi_available() -> bool:
         return False
 
 
+def get_environment_status() -> Dict[str, Any]:
+    """
+    Return environment health report regarding AT-SPI, display, and input capabilities.
+    Follows agent-desktop status conventions.
+    """
+    has_display = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+    has_dbus = bool(os.environ.get("DBUS_SESSION_BUS_ADDRESS") or os.environ.get("AT_SPI_BUS_ADDRESS"))
+    atspi_ok = is_at_spi_available()
+    return {
+        "ok": atspi_ok,
+        "platform": sys.platform,
+        "display": os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY") or None,
+        "has_dbus_session": has_dbus,
+        "has_display": has_display,
+        "atspi_available": atspi_ok,
+        "status_code": "READY" if atspi_ok else ("NO_ACCESSIBILITY_BUS" if not has_dbus else "UNSUPPORTED_DISPLAY"),
+    }
+
+
 def _normalize(value: str) -> str:
     return "".join(character for character in (value or "").casefold() if character.isalnum())
 

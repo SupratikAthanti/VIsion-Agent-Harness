@@ -157,7 +157,10 @@ Enable position-independent control of native desktop applications via the Linux
 - Updated `agent.py`:
   - Added `/desktop [apps|snapshot|click|type|read|focus]` commands
   - Connected desktop routing so desktop tasks invoke AT-SPI direct actions
-- Added comprehensive unit and integration test suite (`tests/test_atspi_desktop.py`) with 20 mock tests covering all AT-SPI capabilities
+- Added comprehensive unit and integration test suite (`tests/test_atspi_desktop.py`) with 23 tests covering all AT-SPI capabilities, security boundaries, and ambiguity handling
+- Implemented authoritative routing with ambiguity detection returning `('ambiguous', clarification_prompt)` when generic targets conflict across browser and desktop apps
+- Implemented production security policy engine blocking destructive desktop operations in headless/automated modes unless explicit `ALLOW_SENSITIVE_ACTIONS=1` is passed
+- Added `get_environment_status()` matching `agent-desktop` standards
 
 **Expected Outcome:**
 - Position-independent desktop app control (window in any position/size)

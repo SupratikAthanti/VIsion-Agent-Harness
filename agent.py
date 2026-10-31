@@ -36,18 +36,27 @@ import playwright_bridge
 import action_executor
 import atspi_bridge
 
-# Sensitive or destructive action patterns requiring safety checks
+# Explicit security & safety enforcement policy
 SENSITIVE_ACTIONS_PATTERN = re.compile(
-    r"\b(delete|remove|close|quit|kill|terminate|shutdown|reboot|restart|poweroff|format|reset|wipe|destroy)\b",
+    r"\b(delete|remove|close|quit|kill|terminate|shutdown|reboot|restart|poweroff|format|reset|wipe|destroy|uninstall|rmdir|unlink)\b",
     re.IGNORECASE,
 )
 
+# System critical apps protected from unintended automated interference
+PROTECTED_SYSTEM_APPS = {
+    "login", "lockscreen", "gnome-screensaver", "systemd", "polkit", "sudo", "auth"
+}
+
 
 def is_sensitive_action(step: Dict) -> bool:
-    """Return True if the instruction targets a potentially destructive action."""
-    target = step.get("target") or ""
-    text = (step.get("params") or {}).get("text") or ""
-    combined = f"{target} {text}"
+    """Return True if the instruction targets a potentially destructive or protected action."""
+    target = (step.get("target") or "").lower()
+    app = ((step.get("params") or {}).get("app") or "").lower()
+    text = ((step.get("params") or {}).get("text") or "").lower()
+    combined = f"{target} {app} {text}"
+
+    if any(p in combined for p in PROTECTED_SYSTEM_APPS):
+        return True
     return bool(SENSITIVE_ACTIONS_PATTERN.search(combined))
 
 
@@ -96,20 +105,25 @@ def execute_instruction(instruction: str, execute: bool = True) -> bool:
             step_target = f" '{step['target']}'" if step.get("target") else ""
             print(f"\n[Step {idx}/{len(steps)}] {step['action']}{step_target}")
 
-        # Safety confirmation for destructive actions in live interactive mode
+        # Safety enforcement gate: interactive confirmation or non-interactive fail-safe
         if execute and is_sensitive_action(step):
             target_desc = step.get('target') or 'this target'
-            if sys.stdin.isatty():
-                try:
-                    conf = input(f"   [Safety Alert] '{step['action']} {target_desc}' may be destructive. Confirm execution? (y/N): ").strip().lower()
-                    if conf not in ("y", "yes"):
-                        print("   Action aborted by user.")
+            # Check if explicit allowlist environment flag is set
+            allow_sensitive = os.environ.get("ALLOW_SENSITIVE_ACTIONS") == "1"
+            if not allow_sensitive:
+                if sys.stdin.isatty():
+                    try:
+                        conf = input(f"   [Security Gate] '{step['action']} {target_desc}' is classified as a sensitive/destructive action. Confirm execution? (y/N): ").strip().lower()
+                        if conf not in ("y", "yes"):
+                            print("   Action denied by user policy.")
+                            return False
+                    except (KeyboardInterrupt, EOFError):
+                        print("\n   Action cancelled.")
                         return False
-                except (KeyboardInterrupt, EOFError):
-                    print("\n   Action cancelled.")
+                else:
+                    # Non-interactive / headless script mode fails closed by default to prevent unsupervised damage
+                    print(f"   [Security Policy Enforced] Action '{step['action']} {target_desc}' blocked in automated/non-interactive mode without ALLOW_SENSITIVE_ACTIONS=1.")
                     return False
-            else:
-                print(f"   [Safety Guard] Executing sensitive action: {step['action']} '{target_desc}'")
 
         ok = _execute_single_step(step, execute)
         if not ok:
@@ -125,12 +139,22 @@ def _execute_single_step(step: Dict, execute: bool) -> bool:
     params = step.get("params") or {}
     app = params.get("app")
 
-    # Routing decision: browser vs desktop
+    # Authoritative window and browser state detection
+    active_window = action_executor.get_active_window_title()
+    browser_active = playwright_bridge.is_browser_open()
+    focused_context = active_window
+    if browser_active and not active_window:
+        focused_context = playwright_bridge.get_bridge().current_title
+
     ctx = {
-        "browser_open": playwright_bridge.is_browser_open(),
-        "focused_app": action_executor.get_active_window_title() or (playwright_bridge.get_bridge().current_title if playwright_bridge.is_browser_open() else None),
+        "browser_open": browser_active,
+        "focused_app": focused_context,
     }
-    route = route_context(step, ctx)
+    route, clarification = route_context(step, ctx)
+
+    if route == "ambiguous":
+        print(f"   [Routing Ambiguity] {clarification}")
+        return False
 
     if action == "WAIT":
         secs = params.get("seconds", 1.0)

@@ -53,6 +53,12 @@ CLI Usage:
 ./agent.py "click @s12345678:e3"
 ```
 
+Safety Policy:
+Destructive actions (e.g. `delete`, `close`, `quit`, `kill`, `shutdown`, `restart`) prompt for explicit user confirmation in interactive sessions, and fail-closed in non-interactive/automated scripts unless `ALLOW_SENSITIVE_ACTIONS=1` is explicitly set.
+```bash
+ALLOW_SENSITIVE_ACTIONS=1 ./agent.py "click Close in Notes"
+```
+
 Interactive controls:
 - `/desktop apps` - List active desktop apps and windows
 - `/desktop snapshot [app]` - Capture accessibility tree snapshot with qualified refs
