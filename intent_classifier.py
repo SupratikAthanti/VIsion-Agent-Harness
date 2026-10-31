@@ -1,19 +1,25 @@
 """
-Rule-based intent classifier for the Vision Agent Harness.
+Rule-based intent classifier and router for the Vision Agent Harness.
 
 Turns a request such as "Type hello in the search box" into a structured dict:
 
     {"action": "TYPE", "target": "search box",
-     "params": {"text": "hello"}, "needs_clarification": None}
+     "params": {"text": "hello", "app": "Notes"}, "needs_clarification": None}
 
-Actions: CLICK, TYPE, NAVIGATE, SCROLL, DRAG, WAIT, MULTISTEP, UNKNOWN.
-Pure regex matching, so classification takes well under 1 ms. No model is loaded.
+Actions: CLICK, TYPE, NAVIGATE, SCROLL, DRAG, WAIT, READ, FOCUS, SNAPSHOT, LIST_APPS, MULTISTEP, UNKNOWN.
+Provides route_context(intent, active_context) to route deterministically between:
+- "browser" (Playwright / CDP)
+- "desktop" (AT-SPI / xdotool)
+- "vision" (OCR / YOLO fallback)
 """
 
 import re
 from typing import Dict, List, Optional, Tuple
 
-ACTIONS = ("CLICK", "TYPE", "NAVIGATE", "SCROLL", "DRAG", "WAIT", "READ", "MULTISTEP", "UNKNOWN")
+ACTIONS = (
+    "CLICK", "TYPE", "NAVIGATE", "SCROLL", "DRAG", "WAIT",
+    "READ", "FOCUS", "SNAPSHOT", "LIST_APPS", "MULTISTEP", "UNKNOWN"
+)
 
 # Trailing element-type words are removed from the target and kept in params["kind"].
 _KIND_WORDS = ("button", "link", "icon", "tab")
@@ -32,12 +38,20 @@ _STEP_SPLIT = re.compile(
 _AND_SPLIT = re.compile(r"\s+and\s+", re.IGNORECASE)
 _ACTION_VERB = re.compile(
     r"^(?:please\s+)?(?:click|tap|press|hit|select|mark|type|enter|write|input|go|open|"
-    r"scroll|wait|drag|find|locate|navigate|visit|read|extract|show)\b",
+    r"scroll|wait|drag|find|locate|navigate|visit|read|extract|show|focus|snapshot|list)\b",
     re.IGNORECASE,
 )
 
+# App scoping pattern: "click File in VS Code" / "type hello in search in Notes"
+_APP_IN = re.compile(r"\s+(?:in|into|of|on\s+app)\s+([A-Z0-9][A-Za-z0-9_\-\s]+)$")
+
+# Snapshot and inspect commands
+_LIST_APPS = re.compile(r"^(?:please\s+)?(?:list\s+apps?|show\s+apps?|get\s+apps?|running\s+apps?)$", re.IGNORECASE)
+_SNAPSHOT = re.compile(r"^(?:please\s+)?(?:snapshot|take\s+snapshot)(?:\s+(?:of|for|app)?\s*(.+))?$", re.IGNORECASE)
+_FOCUS = re.compile(r"^(?:please\s+)?(?:focus|switch\s+to|bring\s+up)\s+(.+)$", re.IGNORECASE)
+
 _READ = re.compile(
-    r"^(?:please\s+)?(?:read|extract|show|get)\s*(?:the\s+)?(page|table|text|content|results?)?(?:\s+(?:from|in|on)\s+(.+))?$",
+    r"^(?:please\s+)?(?:read|extract|show|get)\s*(?:the\s+)?(page|table|text|content|results?|title\s+bar|window)?(?:\s*(?:from|in|of|on)?\s+(.+))?$",
     re.IGNORECASE,
 )
 _WAIT = re.compile(
@@ -63,6 +77,7 @@ _URL = re.compile(
     r"^(?:https?://)?(?:localhost(?::\d+)?|(?:[a-z0-9-]+\.)+[a-z]{2,})(?:[/:?#]\S*)?$",
     re.IGNORECASE,
 )
+_REF_PATTERN = re.compile(r"^@s[a-f0-9]{8}:e\d+$|^@e\d+$|^e\d+$")
 _KIND_SUFFIX = re.compile(r"\s+(" + "|".join(_KIND_WORDS) + r")$", re.IGNORECASE)
 _LEADING_ARTICLE = re.compile(r"^(?:the|a|an|my|your)\s+", re.IGNORECASE)
 _KEYWORD_ELEMENT = re.compile(r"\b(button|link|icon|menu|tab|box|field)\b", re.IGNORECASE)
@@ -89,6 +104,20 @@ def _clean_target(raw: Optional[str]) -> Optional[str]:
     return text or None
 
 
+def _extract_app_scope(target: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    """Extract app name if target has 'in <App>': 'File in VS Code' -> ('File', 'VS Code')."""
+    if not target:
+        return target, None
+    m = _APP_IN.search(target)
+    if m:
+        app_name = m.group(1).strip()
+        # Ensure it's not a common UI element like 'in search' or 'in the menu'
+        if not re.match(r"^(?:search|box|field|menu|table|window|page)$", app_name, re.IGNORECASE):
+            base_target = target[:m.start()].strip()
+            return base_target, app_name
+    return target, None
+
+
 def _split_kind(target: Optional[str]) -> Tuple[Optional[str], Dict]:
     """Split a trailing element-type word off a target: 'gemini button' -> ('gemini', {'kind': 'button'})."""
     if not target:
@@ -101,6 +130,11 @@ def _split_kind(target: Optional[str]) -> Tuple[Optional[str], Dict]:
 
 def _looks_like_url(token: str) -> bool:
     return bool(_URL.match(token.strip("\"'")))
+
+
+def is_ref(token: Optional[str]) -> bool:
+    """Return True if token matches a snapshot reference (@s12345678:e1, @e1, e1)."""
+    return bool(token and _REF_PATTERN.match(token.strip()))
 
 
 def _split_steps(text: str) -> List[str]:
@@ -122,11 +156,28 @@ def _split_steps(text: str) -> List[str]:
 def _classify_single(text: str) -> Dict:
     text = text.strip()
 
+    if _LIST_APPS.match(text):
+        return _result("LIST_APPS")
+
+    m = _SNAPSHOT.match(text)
+    if m:
+        app_target = _clean_target(m.group(1))
+        return _result("SNAPSHOT", target=app_target, params={"app": app_target} if app_target else {})
+
+    m = _FOCUS.match(text)
+    if m:
+        target = _clean_target(m.group(1))
+        return _result("FOCUS", target=target)
+
     m = _READ.match(text)
     if m:
-        target_kind = (m.group(1) or "page").lower()
+        target_kind = (m.group(1) or "page").lower().replace(" ", "_")
         selector = m.group(2)
-        return _result("READ", target=selector, params={"kind": target_kind})
+        base_sel, app_name = _extract_app_scope(selector)
+        params = {"kind": target_kind}
+        if app_name:
+            params["app"] = app_name
+        return _result("READ", target=base_sel, params=params)
 
     m = _WAIT.match(text)
     if m:
@@ -188,8 +239,13 @@ def _classify_single(text: str) -> Dict:
                 typed, target_raw = tm.group(1).strip(), tm.group(2)
             else:
                 typed, target_raw = rest, None
-        target, kind = _split_kind(_clean_target(target_raw))
-        return _result("TYPE", target, {"text": typed, **kind})
+        clean_raw = _clean_target(target_raw)
+        base_target, app_scope = _extract_app_scope(clean_raw)
+        target, kind = _split_kind(base_target)
+        params = {"text": typed, **kind}
+        if app_scope:
+            params["app"] = app_scope
+        return _result("TYPE", target, params)
 
     m = _CLICK.match(text)
     if m:
@@ -206,8 +262,12 @@ def _classify_single(text: str) -> Dict:
 
 
 def _classify_click(raw_target: str, original: str, locate_only: bool = False) -> Dict:
-    target, kind = _split_kind(_clean_target(raw_target))
+    clean_raw = _clean_target(raw_target)
+    base_target, app_scope = _extract_app_scope(clean_raw)
+    target, kind = _split_kind(base_target)
     params = {**kind}
+    if app_scope:
+        params["app"] = app_scope
     if locate_only:
         params["locate_only"] = True
     if not target or target.lower() in _PRONOUNS:
@@ -235,3 +295,80 @@ def classify_intent(query: str) -> Dict:
     parsed = [_classify_single(step) for step in steps]
     first_question = next((p["needs_clarification"] for p in parsed if p["needs_clarification"]), None)
     return _result("MULTISTEP", params={"steps": parsed}, clarification=first_question)
+
+
+# ---------------------------------------------------------------------------
+# Routing Policy: Browser vs Desktop vs Fallback
+# ---------------------------------------------------------------------------
+
+_BROWSER_KEYWORDS = {
+    "web", "website", "url", "page", "browser", "chrome", "chromium", "firefox",
+    "search google", "google.com", "wikipedia", "youtube", "tab", "http", "https"
+}
+
+
+def route_context(intent: Dict, active_context: Optional[Dict] = None) -> str:
+    """
+    Route an intent to 'browser', 'desktop', or 'vision'.
+
+    Routing Policy:
+    1. Explicit browser target:
+       - Action is NAVIGATE to a URL
+       - Target or params explicitly mention URL, web page, or browser context
+       -> 'browser'
+    2. Explicit desktop target:
+       - Ref format (@s...:e...)
+       - Target or params specify an app ('in VS Code', 'in Notes', 'in Terminal')
+       - Action is LIST_APPS, SNAPSHOT, FOCUS
+       -> 'desktop'
+    3. No explicit target:
+       - Active focused context:
+         if focused app is a browser, route to 'browser'
+         if focused app is desktop app, route to 'desktop'
+       - Default to 'desktop' if AT-SPI is available, otherwise 'browser' if browser is open,
+         otherwise 'vision'
+    """
+    action = intent.get("action")
+    target = intent.get("target") or ""
+    params = intent.get("params") or {}
+    app = params.get("app")
+
+    # 1. Desktop-specific actions
+    if action in ("LIST_APPS", "SNAPSHOT", "FOCUS"):
+        return "desktop"
+
+    if is_ref(target):
+        return "desktop"
+
+    if app:
+        # Check if the app name is explicitly a browser
+        if app.lower() in ("chrome", "chromium", "firefox", "browser"):
+            return "browser"
+        return "desktop"
+
+    # 2. Browser-specific actions / targets
+    if action == "NAVIGATE" and params.get("url"):
+        return "browser"
+
+    target_lower = target.lower()
+    if any(k in target_lower for k in _BROWSER_KEYWORDS) or _looks_like_url(target):
+        return "browser"
+
+    # 3. Context-based routing
+    ctx = active_context or {}
+    focused_app = (ctx.get("focused_app") or ctx.get("current_app") or "").lower()
+    browser_open = ctx.get("browser_open", False)
+
+    if focused_app:
+        if any(b in focused_app for b in ("chrome", "chromium", "firefox", "browser")):
+            return "browser"
+        return "desktop"
+
+    # If browser is currently open and has active page, default web-style interactions there
+    if browser_open:
+        # If query has desktop-like verbs or OS menus like "File", "Edit", "Terminal"
+        if target in ("File", "Edit", "View", "Terminal", "Settings", "Save", "Close"):
+            return "desktop"
+        return "browser"
+
+    return "desktop"
