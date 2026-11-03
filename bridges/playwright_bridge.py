@@ -38,6 +38,12 @@ try:
     HAS_PLAYWRIGHT = True
 except ImportError:
     HAS_PLAYWRIGHT = False
+    Browser = Any
+    BrowserContext = Any
+    ElementHandle = Any
+    Locator = Any
+    Page = Any
+    Playwright = Any
 
 import context_memory
 

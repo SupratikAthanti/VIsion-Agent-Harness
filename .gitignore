@@ -16,6 +16,7 @@ __pycache__/
 env/
 venv/
 .venv/
+new_venv/
 build/
 develop-eggs/
 dist/
@@ -35,6 +36,8 @@ wheels/
 # Environment / local configs
 .env
 .cache/
+.remember/
+.freebuff/
 
 # Editor / OS files
 .vscode/
@@ -43,3 +46,4 @@ wheels/
 *.swo
 *~
 .DS_Store
+
