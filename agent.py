@@ -4,8 +4,8 @@ Vision Agent - Interactive Automation CLI
 
 A conversational command-line assistant for local desktop and browser automation.
 Uses the structured-data-first architecture:
-1. Playwright / CDP for high-speed, position-independent browser automation.
-2. AT-SPI for desktop UI trees and coordinates.
+1. Direct AT-SPI accessibility tree inspection and actions for desktop applications.
+2. Playwright / CDP for high-speed, position-independent browser automation.
 3. OCR + YOLO vision pipeline as on-demand fallback.
 
 Usage:
@@ -17,6 +17,7 @@ Usage:
 """
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -28,37 +29,59 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from intent_classifier import classify_intent
+import re
+from intent_classifier import classify_intent, route_context, is_ref
 import context_memory
 import playwright_bridge
 import action_executor
+import atspi_bridge
 
-# Try importing fallback vision modules lazily if needed
-try:
-    import atspi_bridge
-    HAS_ATSPI = atspi_bridge.is_at_spi_available()
-except Exception:
-    HAS_ATSPI = False
+# Explicit security & safety enforcement policy
+SENSITIVE_ACTIONS_PATTERN = re.compile(
+    r"\b(delete|remove|close|quit|kill|terminate|shutdown|reboot|restart|poweroff|format|reset|wipe|destroy|uninstall|rmdir|unlink)\b",
+    re.IGNORECASE,
+)
+
+# System critical apps protected from unintended automated interference
+PROTECTED_SYSTEM_APPS = {
+    "login", "lockscreen", "gnome-screensaver", "systemd", "polkit", "sudo", "auth"
+}
+
+
+def is_sensitive_action(step: Dict) -> bool:
+    """Return True if the instruction targets a potentially destructive or protected action."""
+    target = (step.get("target") or "").lower()
+    app = ((step.get("params") or {}).get("app") or "").lower()
+    text = ((step.get("params") or {}).get("text") or "").lower()
+    combined = f"{target} {app} {text}"
+
+    if any(p in combined for p in PROTECTED_SYSTEM_APPS):
+        return True
+    return bool(SENSITIVE_ACTIONS_PATTERN.search(combined))
 
 
 def _print_banner(execute: bool, headless: bool):
     display = os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY") or "None (Headless)"
+    atspi_status = "Available" if atspi_bridge.is_at_spi_available() else "Inactive/Fallback"
     print("\n" + "=" * 68)
-    print("  Vision Agent CLI (v0.3 - Structured-First Architecture)")
+    print("  Vision Agent CLI (v0.4 - Structured-First Architecture)")
     print("=" * 68)
+    print(f" • Desktop Engine:   AT-SPI ({atspi_status}) + xdotool")
     print(" • Browser Engine:   Playwright Chromium (fast, position-independent)")
-    print(f" • Desktop Engine:   AT-SPI ({'Available' if HAS_ATSPI else 'Inactive/Fallback'}) + xdotool")
     print(f" • Display Server:   {display}")
     print(f" • Execution Mode:   {'LIVE (Actions executed)' if execute else 'DRY RUN (Simulation)'}")
     print("=" * 68)
     print("Commands:")
-    print("  Just type what to do:")
+    print("  Desktop:")
+    print("    • 'list apps'")
+    print("    • 'snapshot Text Editor' or 'snapshot'")
+    print("    • 'click @snapshot_id:e1' or 'click Save in Text Editor'")
+    print("    • 'type hello in Notes' or 'read title bar of Text Editor'")
+    print("  Browser:")
     print("    • 'open google.com'")
     print("    • 'type formula 1 standings in search box and press enter'")
-    print("    • 'click Images'")
     print("    • 'read page' or 'read table'")
-    print("    • 'scroll down'")
-    print("  Controls: /browser [info|close|read], /context, /execute on|off, /exit\n")
+    print("  Controls: /desktop [apps|snapshot|click|type|read|focus], /browser, /context, /exit\n")
 
 
 def execute_instruction(instruction: str, execute: bool = True) -> bool:
@@ -72,7 +95,7 @@ def execute_instruction(instruction: str, execute: bool = True) -> bool:
         if intent.get("needs_clarification"):
             print(f"   {intent['needs_clarification']}")
         else:
-            print("   I didn't recognise that command. Try 'open <url>', 'type <text> in <box>', 'click <button>', or 'read page'.")
+            print("   I didn't recognise that command. Try 'open <url>', 'type <text> in <box>', 'click <button>', or 'snapshot'.")
         return False
 
     steps = intent["params"]["steps"] if intent["action"] == "MULTISTEP" else [intent]
@@ -81,6 +104,26 @@ def execute_instruction(instruction: str, execute: bool = True) -> bool:
         if len(steps) > 1:
             step_target = f" '{step['target']}'" if step.get("target") else ""
             print(f"\n[Step {idx}/{len(steps)}] {step['action']}{step_target}")
+
+        # Safety enforcement gate: interactive confirmation or non-interactive fail-safe
+        if execute and is_sensitive_action(step):
+            target_desc = step.get('target') or 'this target'
+            # Check if explicit allowlist environment flag is set
+            allow_sensitive = os.environ.get("ALLOW_SENSITIVE_ACTIONS") == "1"
+            if not allow_sensitive:
+                if sys.stdin.isatty():
+                    try:
+                        conf = input(f"   [Security Gate] '{step['action']} {target_desc}' is classified as a sensitive/destructive action. Confirm execution? (y/N): ").strip().lower()
+                        if conf not in ("y", "yes"):
+                            print("   Action denied by user policy.")
+                            return False
+                    except (KeyboardInterrupt, EOFError):
+                        print("\n   Action cancelled.")
+                        return False
+                else:
+                    # Non-interactive / headless script mode fails closed by default to prevent unsupervised damage
+                    print(f"   [Security Policy Enforced] Action '{step['action']} {target_desc}' blocked in automated/non-interactive mode without ALLOW_SENSITIVE_ACTIONS=1.")
+                    return False
 
         ok = _execute_single_step(step, execute)
         if not ok:
@@ -94,6 +137,24 @@ def _execute_single_step(step: Dict, execute: bool) -> bool:
     action = step["action"]
     target = step.get("target")
     params = step.get("params") or {}
+    app = params.get("app")
+
+    # Authoritative window and browser state detection
+    active_window = action_executor.get_active_window_title()
+    browser_active = playwright_bridge.is_browser_open()
+    focused_context = active_window
+    if browser_active and not active_window:
+        focused_context = playwright_bridge.get_bridge().current_title
+
+    ctx = {
+        "browser_open": browser_active,
+        "focused_app": focused_context,
+    }
+    route, clarification = route_context(step, ctx)
+
+    if route == "ambiguous":
+        print(f"   [Routing Ambiguity] {clarification}")
+        return False
 
     if action == "WAIT":
         secs = params.get("seconds", 1.0)
@@ -101,6 +162,48 @@ def _execute_single_step(step: Dict, execute: bool) -> bool:
             action_executor.wait(secs)
         print(f"   {'Waited' if execute else 'Would wait'} {secs:g}s")
         return True
+
+    if action == "LIST_APPS":
+        apps = atspi_bridge.list_apps()
+        if not apps:
+            print("   No accessible desktop applications detected (or accessibility bus inactive).")
+            return False
+        print(f"   --- Desktop Applications ({len(apps)}) ---")
+        for a in apps:
+            wins = f" - Windows: {', '.join(a['windows'])}" if a.get("windows") else ""
+            print(f"   [{a['app_id']}] {a['name']}{wins}")
+        return True
+
+    if action == "SNAPSHOT":
+        app_name = target or app
+        snap = atspi_bridge.snapshot(app_name=app_name, interactive_only=True)
+        if not snap.get("ok"):
+            print(f"   Snapshot failed: {snap.get('error')}")
+            return False
+        elems = snap.get("elements", [])
+        print(f"   --- Snapshot {snap['snapshot_id']} for '{snap['app']}' ({len(elems)} elements) ---")
+        for e in elems[:30]:
+            name_str = f" \"{e['name']}\"" if e.get("name") else ""
+            bounds_str = f" {e['bounds']}" if e.get("bounds") else ""
+            acts_str = f" [{', '.join(e['actions'])}]" if e.get("actions") else ""
+            print(f"   {e['ref_id']:<15} {e['role']:<15}{name_str}{bounds_str}{acts_str}")
+        if len(elems) > 30:
+            print(f"   ... and {len(elems) - 30} more elements")
+        return True
+
+    if action == "FOCUS":
+        if not target:
+            print("   No focus target specified.")
+            return False
+        if not execute:
+            print(f"   Would focus '{target}'")
+            return True
+        if atspi_bridge.is_at_spi_available():
+            if atspi_bridge.grab_focus(target):
+                print(f"   Focused '{target}' via AT-SPI.")
+                return True
+        print(f"   Could not focus '{target}'.")
+        return False
 
     if action == "NAVIGATE":
         url = params.get("url") or target
@@ -119,10 +222,33 @@ def _execute_single_step(step: Dict, execute: bool) -> bool:
         return ok
 
     if action == "READ":
-        if not playwright_bridge.is_browser_open():
-            print("   'read' requires an open web page.")
-            return False
         kind = params.get("kind", "page")
+        # 1. Desktop read
+        if route == "desktop" or is_ref(target) or app:
+            elem_data = atspi_bridge.read_element(target) if target else None
+            if elem_data:
+                print(f"   --- Accessible Element: {elem_data.get('name') or target} ---")
+                for k, v in elem_data.items():
+                    if v:
+                        print(f"   {k}: {v}")
+                return True
+            # Read all elements of app or window
+            snap = atspi_bridge.snapshot(app_name=app)
+            if snap.get("ok") and snap.get("elements"):
+                print(f"   --- Desktop Content for '{snap['app']}' ---")
+                for e in snap["elements"][:20]:
+                    t = e.get("text") or e.get("name")
+                    if t:
+                        print(f"   [{e['role']}] {t}")
+                return True
+            print(f"   Could not read desktop element '{target}'.")
+            return False
+
+        # 2. Browser read
+        if not playwright_bridge.is_browser_open():
+            print("   'read' requires an open web page or desktop target.")
+            return False
+
         if kind == "table":
             rows = playwright_bridge.read_table(target)
             if rows:
@@ -148,7 +274,7 @@ def _execute_single_step(step: Dict, execute: bool) -> bool:
         if not execute:
             print(f"   Would scroll {direction} by {amount}")
             return True
-        if playwright_bridge.is_browser_open():
+        if route == "browser" and playwright_bridge.is_browser_open():
             return playwright_bridge.scroll(direction, amount)
         return action_executor.scroll(direction, amount)
 
@@ -159,7 +285,7 @@ def _execute_single_step(step: Dict, execute: bool) -> bool:
             if not execute:
                 print(f"   Would press key '{key}'")
                 return True
-            if playwright_bridge.is_browser_open():
+            if route == "browser" and playwright_bridge.is_browser_open():
                 return playwright_bridge.press_key(key)
             return action_executor.press_key(key)
 
@@ -173,14 +299,47 @@ def _execute_single_step(step: Dict, execute: bool) -> bool:
             print(f"   Would type {typed_text!r} into {dest}")
             return True
 
-        # Try Playwright first if browser is active
+        # Desktop route (AT-SPI primary)
+        if route == "desktop" or is_ref(target) or app:
+            try:
+                elem = atspi_bridge.find_element_by_name(target, app_name=app, require_single=True) if (target and not is_ref(target)) else None
+            except ValueError as e:
+                print(f"   [Error] {e}. Specify the app or use a qualified ref.")
+                return False
+
+            ref_or_target = elem.get("ref_id") if elem else target
+            if ref_or_target:
+                # Strict verification: verify field is editable before modifying
+                if not atspi_bridge.is_editable(ref_or_target):
+                    print(f"   [Error] Target '{target}' is not an editable field. Aborting to prevent misdirected typing.")
+                    return False
+
+                # Direct AT-SPI EditableText
+                if atspi_bridge.set_text_contents(ref_or_target, typed_text):
+                    print(f"   Typed {typed_text!r} into '{target}' via AT-SPI editable text.")
+                    return True
+                # Verified editable but direct API failed: focus then xdotool typing
+                atspi_bridge.grab_focus(ref_or_target)
+                if action_executor.type_text(typed_text, accessible_ref=ref_or_target):
+                    print(f"   Typed {typed_text!r} into '{target}' via focused input.")
+                    return True
+                return False
+
+            print(f"   Could not find desktop field '{target}'.")
+            return False
+
+        # Browser route (Playwright primary)
         if playwright_bridge.is_browser_open():
             ok = playwright_bridge.type_text(typed_text, target=target)
             if ok:
                 return True
-            print(f"   Field '{target}' not found in web page; trying desktop...")
 
-        # Desktop fallback
+        # If a specific target was requested, do not type blindly into active window
+        if target:
+            print(f"   [Error] Specific field '{target}' could not be resolved. Aborting typing.")
+            return False
+
+        # General active focus typing only if no target was specified
         return action_executor.type_text(typed_text)
 
     if action == "CLICK":
@@ -189,23 +348,48 @@ def _execute_single_step(step: Dict, execute: bool) -> bool:
             return False
 
         if not execute:
-            print(f"   Would click '{target}'")
+            print(f"   Would click '{target}' (routed to: {route})")
             return True
 
-        # Try Playwright first if browser is active
+        # Desktop route (AT-SPI primary)
+        if route == "desktop" or is_ref(target) or app:
+            try:
+                elem = atspi_bridge.find_element_by_name(target, app_name=app, require_single=True) if (target and not is_ref(target)) else None
+            except ValueError as e:
+                print(f"   [Error] {e}. Specify the app or use a qualified ref.")
+                return False
+
+            ref_or_target = elem.get("ref_id") if elem else target
+            if ref_or_target:
+                if atspi_bridge.click_element(ref_or_target):
+                    print(f"   Clicked '{target}' via AT-SPI desktop action.")
+                    return True
+                # Try bounding box click via xdotool if action invocation failed
+                bounds = atspi_bridge.get_element_bounds(ref_or_target)
+                if bounds:
+                    screen = action_executor.get_screen_size()
+                    if screen:
+                        x_pct = (bounds[0] + bounds[2] / 2) / screen[0]
+                        y_pct = (bounds[1] + bounds[3] / 2) / screen[1]
+                        if action_executor.click_at(x_pct, y_pct, use_atspi_action=False):
+                            print(f"   Clicked '{target}' at live desktop coordinates.")
+                            return True
+
+        # Browser route (Playwright primary)
         if playwright_bridge.is_browser_open():
             ok = playwright_bridge.click_element(target, kind=params.get("kind"))
             if ok:
                 return True
-            print(f"   Element '{target}' not found in web page; trying desktop...")
 
-        # Desktop fallback via AT-SPI or xdotool
-        if HAS_ATSPI:
-            elem = atspi_bridge.find_element_by_name(target)
-            if elem and elem.get("ref"):
-                if atspi_bridge.click_element(elem["ref"]):
-                    print(f"   Clicked '{target}' via AT-SPI desktop action.")
-                    return True
+        # Desktop fallback if routed to browser but failed
+        if route != "desktop" and atspi_bridge.is_at_spi_available():
+            try:
+                elem = atspi_bridge.find_element_by_name(target, app_name=app, require_single=True)
+            except ValueError:
+                elem = None
+            if elem and atspi_bridge.click_element(elem.get("ref_id") or target):
+                print(f"   Clicked '{target}' via AT-SPI fallback.")
+                return True
 
         print(f"   Could not find clickable element '{target}'.")
         return False
@@ -228,7 +412,7 @@ def run_repl(execute: bool = True, headless: Optional[bool] = None):
                 title = playwright_bridge.get_bridge().current_title or "Browser"
                 if len(title) > 28:
                     title = title[:25] + "..."
-                prompt = f"Vision Agent [{title}] > "
+                prompt = f"Vision Agent [Browser: {title}] > "
             else:
                 prompt = "Vision Agent > "
 
@@ -257,6 +441,31 @@ def run_repl(execute: bool = True, headless: Optional[bool] = None):
                 print(f"Recent actions: {len(ctx['last_actions'])}")
                 for a in ctx["last_actions"][-5:]:
                     print(f"  - {a.get('action')} {a.get('target') or a.get('url') or ''}")
+                continue
+
+            if cmd.startswith("/desktop"):
+                parts = user_input.split(maxsplit=2)
+                sub = parts[1].lower() if len(parts) > 1 else "apps"
+                arg = parts[2].strip() if len(parts) > 2 else None
+                if sub == "apps":
+                    _execute_single_step({"action": "LIST_APPS"}, execute)
+                elif sub == "snapshot":
+                    _execute_single_step({"action": "SNAPSHOT", "target": arg, "params": {"app": arg}}, execute)
+                elif sub == "click" and arg:
+                    _execute_single_step({"action": "CLICK", "target": arg, "params": {}}, execute)
+                elif sub == "type" and arg:
+                    # e.g. /desktop type @s123:e1 hello or /desktop type hello
+                    type_parts = arg.split(maxsplit=1)
+                    if len(type_parts) == 2 and is_ref(type_parts[0]):
+                        _execute_single_step({"action": "TYPE", "target": type_parts[0], "params": {"text": type_parts[1]}}, execute)
+                    else:
+                        _execute_single_step({"action": "TYPE", "target": None, "params": {"text": arg}}, execute)
+                elif sub == "read":
+                    _execute_single_step({"action": "READ", "target": arg, "params": {"kind": "desktop"}}, execute)
+                elif sub == "focus" and arg:
+                    _execute_single_step({"action": "FOCUS", "target": arg, "params": {}}, execute)
+                else:
+                    print("Usage: /desktop [apps | snapshot [app] | click <ref|name> | type [ref] <text> | read [ref] | focus <ref>]")
                 continue
 
             if cmd.startswith("/browser"):

@@ -35,6 +35,38 @@ Before building the agent, verify the following for the specific model revision 
 
 Use the current `llama.cpp` documentation and the model's own model card for the supported command, required files, and conversion steps. Do not assume that a successful text-only load proves image input works. If the model fails the multimodal test, select another supported checkpoint or use a separate inference runtime; do not silently fall back to text-only behavior.
 
+## Desktop Automation via AT-SPI (Phase 4)
+
+The harness features full structured desktop control powered by Linux AT-SPI:
+- **Snapshot & Refs**: Capture application accessibility trees (`snapshot`, `list apps`) with qualified refs (`@s12345678:e1`), inspired by `agent-desktop`.
+- **Direct Actions**: Perform clicks and button presses headless via `Atspi.Action` without synthetic pointer events.
+- **Editable Text**: Set field contents directly via `Atspi.EditableText` (`set_text_contents`) without stealing window focus.
+- **Semantic Reading**: Read full element states, values, descriptions, and bounds.
+- **Disambiguation & Routing**: Route browser tasks to Playwright, desktop application tasks to AT-SPI, and fallback to vision.
+
+CLI Usage:
+```bash
+./agent.py "list apps"
+./agent.py "snapshot Text Editor"
+./agent.py "click File in VS Code"
+./agent.py "type hello in Notes"
+./agent.py "click @s12345678:e3"
+```
+
+Safety Policy:
+Destructive actions (e.g. `delete`, `close`, `quit`, `kill`, `shutdown`, `restart`) prompt for explicit user confirmation in interactive sessions, and fail-closed in non-interactive/automated scripts unless `ALLOW_SENSITIVE_ACTIONS=1` is explicitly set.
+```bash
+ALLOW_SENSITIVE_ACTIONS=1 ./agent.py "click Close in Notes"
+```
+
+Interactive controls:
+- `/desktop apps` - List active desktop apps and windows
+- `/desktop snapshot [app]` - Capture accessibility tree snapshot with qualified refs
+- `/desktop click <ref|name>` - Click element via AT-SPI
+- `/desktop type [ref] <text>` - Set text contents directly
+- `/desktop read [ref]` - Read semantic properties of an accessible element
+- `/desktop focus <ref>` - Grab accessibility focus
+
 ## Agent shape
 
 Keep model inference separate from action execution:

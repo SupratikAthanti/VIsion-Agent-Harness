@@ -216,10 +216,24 @@ def click_with_retry(x_pct: float, y_pct: float,
     return False
 
 
-def type_text(text: str, x_pct: Optional[float] = None, y_pct: Optional[float] = None) -> bool:
-    """Focus the field at (x_pct, y_pct) by clicking it, then type `text`. Without coordinates, types into the focused window."""
+def type_text(text: str, x_pct: Optional[float] = None, y_pct: Optional[float] = None,
+              accessible_ref: Optional[str] = None, use_atspi_action: bool = True) -> bool:
+    """
+    Set text content. Tries AT-SPI direct EditableText insertion first (without taking focus),
+    falling back to clicking (focusing) and typing via xdotool.
+    """
+    if use_atspi_action and accessible_ref:
+        try:
+            if atspi_bridge.is_at_spi_available():
+                if atspi_bridge.set_text_contents(accessible_ref, text):
+                    time.sleep(DEFAULT_DELAY)
+                    return True
+                _warn("AT-SPI editable text failed; falling back to focus + typing")
+        except Exception as e:
+            _warn(f"AT-SPI direct text setting unavailable ({e}); falling back to focus + typing")
+
     if x_pct is not None and y_pct is not None:
-        if not click_at(x_pct, y_pct, use_atspi_action=False):
+        if not click_at(x_pct, y_pct, accessible_ref=accessible_ref, use_atspi_action=False):
             return False
     ok = _run(["type", "--delay", str(TYPE_DELAY_MS), "--", text])
     time.sleep(DEFAULT_DELAY)
