@@ -29,12 +29,35 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+import json
 import re
 from intent_classifier import classify_intent, route_context, is_ref
+from simple_router import route_simple, add_known_website, add_known_app
 import context_memory
 import playwright_bridge
 import action_executor
 import atspi_bridge
+import cursor_overlay
+
+# Load config for known websites/apps
+CONFIG_PATH = Path(__file__).parent / "config.json"
+try:
+    with open(CONFIG_PATH) as f:
+        _CONFIG = json.load(f)
+except Exception:
+    _CONFIG = {"known_websites": {}, "known_apps": {}}
+
+# Global cursor overlay instance (persistent)
+_cursor_overlay = None
+def _get_cursor_overlay():
+    """Lazily create and return cursor overlay."""
+    global _cursor_overlay
+    if _cursor_overlay is None and os.environ.get("DISPLAY"):
+        try:
+            _cursor_overlay = cursor_overlay.CursorOverlay()
+        except Exception:
+            pass
+    return _cursor_overlay
 
 # Explicit security & safety enforcement policy
 SENSITIVE_ACTIONS_PATTERN = re.compile(
@@ -60,11 +83,225 @@ def is_sensitive_action(step: Dict) -> bool:
     return bool(SENSITIVE_ACTIONS_PATTERN.search(combined))
 
 
+def _print_help():
+    """Print help information."""
+    print("\n" + "=" * 68)
+    print("  Vision Agent CLI - Help")
+    print("=" * 68)
+    print("\nNatural Language Commands:")
+    print("  Browser:")
+    print("    • 'open google.com' or just 'google'")
+    print("    • 'open youtube.com' or just 'youtube'")
+    print("    • 'open formula1.com' or just 'formula1'")
+    print("    • 'type <text> in <box>'")
+    print("    • 'click <button>'")
+    print("    • 'read page' or 'read table'")
+    print("    • 'scroll down' / 'scroll up'")
+    print("\n  Desktop:")
+    print("    • 'open vs code' or 'open terminal'")
+    print("    • 'list apps' - Show running applications")
+    print("    • 'snapshot <app>' - Take accessibility snapshot")
+    print("    • 'click @ref' or 'click <name> in <app>'")
+    print("    • 'type <text> in <field> in <app>'")
+    print("    • 'read <element> in <app>'")
+    print("\nSlash Commands:")
+    print("  /help            - Show this help")
+    print("  /desktop apps    - List desktop apps")
+    print("  /desktop snapshot - Take desktop snapshot")
+    print("  /desktop click <target> - Click via AT-SPI")
+    print("  /desktop type <text> in <target> - Type via AT-SPI")
+    print("  /desktop read <target> - Read element state")
+    print("  /browser info    - Browser status")
+    print("  /browser close   - Close browser")
+    print("  /context         - Show current context")
+    print("  /execute on/off  - Toggle real execution")
+    print("  /cursor on/off   - Toggle persistent blue cursor")
+    print("  /add-website <name> <url> - Add known website")
+    print("  /add-app <name> <cmd> - Add known app")
+    print("  /exit            - Exit CLI")
+    print("\nKnown Websites (from config.json):")
+    for name, config in _CONFIG["known_websites"].items():
+        print(f"    • {name}: {config['url']}")
+    print("\nKnown Apps (from config.json):")
+    for name, config in _CONFIG["known_apps"].items():
+        print(f"    • {name}: {config['launch_cmd']}")
+    print("=" * 68 + "\n")
+
+
+def _handle_command(cmd: str, execute: bool) -> bool:
+    """Handle slash commands."""
+    cmd_lower = cmd.lower()
+
+    if cmd_lower == "/help" or cmd_lower == "/h":
+        _print_help()
+        return True
+
+    if cmd_lower.startswith("/cursor"):
+        parts = cmd.split(maxsplit=2)
+        if len(parts) > 1:
+            state = parts[1].lower()
+            overlay = _get_cursor_overlay()
+            if overlay:
+                if state == "on":
+                    if overlay.is_visible():
+                        print("   Cursor is already visible")
+                    else:
+                        # Show at center of screen
+                        screen = action_executor.get_screen_size()
+                        if screen:
+                            overlay.show_cursor(screen[0] // 2, screen[1] // 2)
+                            print("   Persistent blue cursor enabled (visible at screen center)")
+                elif state == "off":
+                    overlay.hide_cursor()
+                    print("   Persistent blue cursor disabled")
+                else:
+                    print("   Usage: /cursor on|off")
+            else:
+                print("   Cursor overlay not available (no DISPLAY or X11)")
+        return True
+
+    if cmd_lower.startswith("/add-website"):
+        parts = cmd.split(maxsplit=3)
+        if len(parts) >= 3:
+            name = parts[2]
+            url = parts[3] if len(parts) > 3 else None
+            if url:
+                if add_known_website(name, url):
+                    print(f"   Added website '{name}' -> {url}")
+                    return True
+                else:
+                    print(f"   Failed to add website")
+                    return False
+        print("   Usage: /add-website <name> <url>")
+        return False
+
+    if cmd_lower.startswith("/add-app"):
+        parts = cmd.split(maxsplit=3)
+        if len(parts) >= 3:
+            name = parts[2]
+            launch_cmd = parts[3] if len(parts) > 3 else None
+            if launch_cmd:
+                if add_known_app(name, launch_cmd):
+                    print(f"   Added app '{name}' -> {launch_cmd}")
+                    return True
+                else:
+                    print(f"   Failed to add app")
+                    return False
+        print("   Usage: /add-app <name> <launch_cmd>")
+        return False
+
+    if cmd_lower.startswith("/desktop"):
+        return _handle_desktop_command(cmd, execute)
+
+    if cmd_lower.startswith("/browser"):
+        return _handle_browser_command(cmd, execute)
+
+    print(f"   Unknown command: {cmd}")
+    return False
+
+
+def _handle_desktop_command(cmd: str, execute: bool) -> bool:
+    """Handle /desktop commands."""
+    parts = cmd.split(maxsplit=2)
+    sub = parts[1].lower() if len(parts) > 1 else "info"
+
+    if sub == "apps" or sub == "list":
+        apps = atspi_bridge.list_apps()
+        print(f"   --- Running Apps ({len(apps)}) ---")
+        for app in apps:
+            print(f"   • {app['name']}")
+            for win in app.get("windows", []):
+                print(f"     - {win}")
+        return True
+
+    if sub == "snapshot":
+        app_name = parts[2] if len(parts) > 2 else None
+        snap = atspi_bridge.snapshot(app_name, interactive_only=False)
+        if snap.get("ok"):
+            print(f"   --- Snapshot of '{snap['app']}' ({snap['ref_count']} elements) ---")
+            for e in snap["elements"][:15]:
+                print(f"   [{e['role']}] {e['name']} @ {e['ref_id']}")
+            return True
+        print(f"   Snapshot failed")
+        return False
+
+    if sub == "click":
+        if len(parts) < 3:
+            print("   Usage: /desktop click <target>")
+            return False
+        target = parts[2]
+        return _execute_single_step({
+            "action": "CLICK",
+            "target": target,
+            "params": {}
+        }, execute, route="desktop")
+
+    if sub == "type":
+        if len(parts) < 4:
+            print("   Usage: /desktop type <text> in <target>")
+            return False
+        text = parts[2]
+        target = parts[4] if len(parts) > 4 else None
+        return _execute_single_step({
+            "action": "TYPE",
+            "target": target,
+            "params": {"text": text}
+        }, execute, route="desktop")
+
+    if sub == "read":
+        if len(parts) < 3:
+            print("   Usage: /desktop read <target>")
+            return False
+        target = parts[2]
+        return _execute_single_step({
+            "action": "READ",
+            "target": target,
+            "params": {}
+        }, execute, route="desktop")
+
+    print(f"   Unknown /desktop subcommand: {sub}")
+    return False
+
+
+def _handle_browser_command(cmd: str, execute: bool) -> bool:
+    """Handle /browser commands."""
+    parts = cmd.split(maxsplit=2)
+    sub = parts[1].lower() if len(parts) > 1 else "info"
+
+    if sub in ("info", "status"):
+        if playwright_bridge.is_browser_open():
+            b = playwright_bridge.get_bridge()
+            print(f"Browser active: '{b.current_title}' [{b.current_url}]")
+        else:
+            print("Browser is not open.")
+        return True
+
+    if sub == "close":
+        if playwright_bridge.is_browser_open():
+            playwright_bridge.close_browser()
+            print("Browser closed.")
+        else:
+            print("Browser is not open.")
+        return True
+
+    if sub == "read":
+        sel = parts[2] if len(parts) > 2 else None
+        if playwright_bridge.is_browser_open():
+            content = playwright_bridge.read_content(sel)
+            print(content if content else "(empty)")
+        else:
+            print("Browser is not open.")
+        return True
+
+    print(f"   Unknown /browser subcommand: {sub}")
+    return False
+
+
 def _print_banner(execute: bool, headless: bool):
     display = os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY") or "None (Headless)"
     atspi_status = "Available" if atspi_bridge.is_at_spi_available() else "Inactive/Fallback"
     print("\n" + "=" * 68)
-    print("  Vision Agent CLI (v0.4 - Structured-First Architecture)")
+    print("  Vision Agent CLI (v0.5 - Simplified Routing)")
     print("=" * 68)
     print(f" • Desktop Engine:   AT-SPI ({atspi_status}) + xdotool")
     print(" • Browser Engine:   Playwright Chromium (fast, position-independent)")
@@ -72,16 +309,11 @@ def _print_banner(execute: bool, headless: bool):
     print(f" • Execution Mode:   {'LIVE (Actions executed)' if execute else 'DRY RUN (Simulation)'}")
     print("=" * 68)
     print("Commands:")
-    print("  Desktop:")
-    print("    • 'list apps'")
-    print("    • 'snapshot Text Editor' or 'snapshot'")
-    print("    • 'click @snapshot_id:e1' or 'click Save in Text Editor'")
-    print("    • 'type hello in Notes' or 'read title bar of Text Editor'")
-    print("  Browser:")
-    print("    • 'open google.com'")
-    print("    • 'type formula 1 standings in search box and press enter'")
-    print("    • 'read page' or 'read table'")
-    print("  Controls: /desktop [apps|snapshot|click|type|read|focus], /browser, /context, /exit\n")
+    print("  Quick Start:")
+    print("    • 'google' or 'youtube' - Open known websites")
+    print("    • 'open vs code' - Launch apps")
+    print("    • 'list apps' - Show running apps")
+    print("  Type /help for full command list\n")
 
 
 def execute_instruction(instruction: str, execute: bool = True) -> bool:
@@ -90,6 +322,72 @@ def execute_instruction(instruction: str, execute: bool = True) -> bool:
     if not text:
         return True
 
+    # Try simple routing first (fast path for common commands)
+    simple_route = route_simple(text)
+    if simple_route:
+        route_type, params = simple_route
+        if route_type == "command":
+            return _handle_command(params["cmd"], execute)
+        elif route_type == "browser":
+            if "url" in params:
+                return _execute_single_step({
+                    "action": "NAVIGATE",
+                    "params": {"url": params["url"]},
+                    "target": None
+                }, execute, route="browser")
+        elif route_type == "desktop_app":
+            # Launch or focus app
+            app_name = params.get("app")
+            launch_cmd = params.get("launch_cmd", app_name)
+            print(f"   Launching/focusing {app_name}...")
+            if execute:
+                import subprocess
+                try:
+                    subprocess.Popen([launch_cmd], start_new_session=True)
+                    print(f"   Launched {app_name}")
+                    return True
+                except Exception as e:
+                    print(f"   Failed to launch: {e}")
+                    return False
+            else:
+                print(f"   Would launch {app_name}")
+                return True
+        elif route_type == "desktop_ref":
+            # Action on a ref
+            ref = params["ref"]
+            action = params.get("action", "click")
+            if action == "click":
+                return _execute_single_step({
+                    "action": "CLICK",
+                    "target": ref,
+                    "params": {}
+                }, execute, route="desktop")
+            elif action == "type":
+                # Need to extract text to type
+                type_match = re.search(r'type\s+(.+?)\s+in', text, re.IGNORECASE)
+                if type_match:
+                    type_text = type_match.group(1)
+                    return _execute_single_step({
+                        "action": "TYPE",
+                        "target": ref,
+                        "params": {"text": type_text}
+                    }, execute, route="desktop")
+        elif route_type == "desktop_scope":
+            # Desktop action with optional app scope
+            return _execute_single_step({
+                "action": "UNKNOWN",  # Will be classified
+                "target": params.get("text"),
+                "params": {"app": params.get("app")}
+            }, execute, route="desktop")
+        elif route_type == "desktop_command":
+            cmd = params.get("action")
+            if cmd == "list_apps":
+                return _handle_desktop_command("list_apps", execute)
+            elif cmd == "snapshot":
+                app = params.get("app")
+                return _handle_desktop_command(f"snapshot {app}" if app else "snapshot", execute)
+
+    # Fall back to intent classifier for complex cases
     intent = classify_intent(text)
     if intent["action"] == "UNKNOWN":
         if intent.get("needs_clarification"):
@@ -104,6 +402,12 @@ def execute_instruction(instruction: str, execute: bool = True) -> bool:
         if len(steps) > 1:
             step_target = f" '{step['target']}'" if step.get("target") else ""
             print(f"\n[Step {idx}/{len(steps)}] {step['action']}{step_target}")
+
+        # Determine route if not already set
+        step_route = route
+        if not step_route:
+            ctx = route_context(step, {"browser_open": playwright_bridge.is_browser_open()})
+            step_route = ctx[0] if ctx else "desktop"
 
         # Safety enforcement gate: interactive confirmation or non-interactive fail-safe
         if execute and is_sensitive_action(step):
@@ -125,7 +429,7 @@ def execute_instruction(instruction: str, execute: bool = True) -> bool:
                     print(f"   [Security Policy Enforced] Action '{step['action']} {target_desc}' blocked in automated/non-interactive mode without ALLOW_SENSITIVE_ACTIONS=1.")
                     return False
 
-        ok = _execute_single_step(step, execute)
+        ok = _execute_single_step(step, execute, route=step_route)
         if not ok:
             print(f"   [Step {idx} stopped]")
             return False
@@ -133,7 +437,7 @@ def execute_instruction(instruction: str, execute: bool = True) -> bool:
     return True
 
 
-def _execute_single_step(step: Dict, execute: bool) -> bool:
+def _execute_single_step(step: Dict, execute: bool, route: str = None) -> bool:
     action = step["action"]
     target = step.get("target")
     params = step.get("params") or {}
@@ -150,11 +454,12 @@ def _execute_single_step(step: Dict, execute: bool) -> bool:
         "browser_open": browser_active,
         "focused_app": focused_context,
     }
-    route, clarification = route_context(step, ctx)
-
-    if route == "ambiguous":
-        print(f"   [Routing Ambiguity] {clarification}")
-        return False
+    # Use passed route, or calculate if not provided
+    if not route:
+        route, clarification = route_context(step, ctx)
+        if route == "ambiguous":
+            print(f"   [Routing Ambiguity] {clarification}")
+            return False
 
     if action == "WAIT":
         secs = params.get("seconds", 1.0)
@@ -361,11 +666,21 @@ def _execute_single_step(step: Dict, execute: bool) -> bool:
 
             ref_or_target = elem.get("ref_id") if elem else target
             if ref_or_target:
+                # Move cursor to target before clicking (if persistent cursor is on)
+                bounds = atspi_bridge.get_element_bounds(ref_or_target)
+                if bounds:
+                    screen = action_executor.get_screen_size()
+                    if screen:
+                        x_px = int(bounds[0] + bounds[2] / 2)
+                        y_px = int(bounds[1] + bounds[3] / 2)
+                        overlay = _get_cursor_overlay()
+                        if overlay and overlay.is_visible():
+                            overlay.move_cursor(x_px, y_px)
+
                 if atspi_bridge.click_element(ref_or_target):
                     print(f"   Clicked '{target}' via AT-SPI desktop action.")
                     return True
                 # Try bounding box click via xdotool if action invocation failed
-                bounds = atspi_bridge.get_element_bounds(ref_or_target)
                 if bounds:
                     screen = action_executor.get_screen_size()
                     if screen:
@@ -443,53 +758,9 @@ def run_repl(execute: bool = True, headless: Optional[bool] = None):
                     print(f"  - {a.get('action')} {a.get('target') or a.get('url') or ''}")
                 continue
 
-            if cmd.startswith("/desktop"):
-                parts = user_input.split(maxsplit=2)
-                sub = parts[1].lower() if len(parts) > 1 else "apps"
-                arg = parts[2].strip() if len(parts) > 2 else None
-                if sub == "apps":
-                    _execute_single_step({"action": "LIST_APPS"}, execute)
-                elif sub == "snapshot":
-                    _execute_single_step({"action": "SNAPSHOT", "target": arg, "params": {"app": arg}}, execute)
-                elif sub == "click" and arg:
-                    _execute_single_step({"action": "CLICK", "target": arg, "params": {}}, execute)
-                elif sub == "type" and arg:
-                    # e.g. /desktop type @s123:e1 hello or /desktop type hello
-                    type_parts = arg.split(maxsplit=1)
-                    if len(type_parts) == 2 and is_ref(type_parts[0]):
-                        _execute_single_step({"action": "TYPE", "target": type_parts[0], "params": {"text": type_parts[1]}}, execute)
-                    else:
-                        _execute_single_step({"action": "TYPE", "target": None, "params": {"text": arg}}, execute)
-                elif sub == "read":
-                    _execute_single_step({"action": "READ", "target": arg, "params": {"kind": "desktop"}}, execute)
-                elif sub == "focus" and arg:
-                    _execute_single_step({"action": "FOCUS", "target": arg, "params": {}}, execute)
-                else:
-                    print("Usage: /desktop [apps | snapshot [app] | click <ref|name> | type [ref] <text> | read [ref] | focus <ref>]")
-                continue
-
-            if cmd.startswith("/browser"):
-                parts = user_input.split(maxsplit=2)
-                sub = parts[1].lower() if len(parts) > 1 else "info"
-                if sub in ("info", "status"):
-                    if playwright_bridge.is_browser_open():
-                        b = playwright_bridge.get_bridge()
-                        print(f"Browser active: '{b.current_title}' [{b.current_url}]")
-                    else:
-                        print("Browser is not open.")
-                elif sub == "close":
-                    if playwright_bridge.is_browser_open():
-                        playwright_bridge.close_browser()
-                        print("Browser closed.")
-                    else:
-                        print("Browser is not open.")
-                elif sub == "read":
-                    sel = parts[2].strip() if len(parts) > 2 else None
-                    if playwright_bridge.is_browser_open():
-                        content = playwright_bridge.read_content(sel)
-                        print(content if content else "(empty)")
-                    else:
-                        print("Browser is not open.")
+            # Handle all slash commands through unified handler
+            if cmd.startswith("/"):
+                _handle_command(user_input, execute)
                 continue
 
             t0 = time.time()

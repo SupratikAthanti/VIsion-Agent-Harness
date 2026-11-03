@@ -149,6 +149,9 @@ class CursorOverlay:
         self._commands: "queue.Queue[Tuple[str, Optional[int], Optional[int], threading.Event]]" = queue.Queue()
         self._ready = threading.Event()
         self._available = False
+        self._visible = False
+        self._current_x = 0
+        self._current_y = 0
         self._thread = threading.Thread(target=self._run, name="cursor-overlay", daemon=True)
         self._thread.start()
         self._ready.wait(timeout=2.0)
@@ -191,13 +194,24 @@ class CursorOverlay:
                         break
                     try:
                         if command == "show":
+                            self._current_x = x
+                            self._current_y = y
+                            self._visible = True
                             root.geometry(f"{_WIDTH}x{_HEIGHT}+{x}+{y}")
                             root.deiconify()
                             root.attributes("-alpha", 1.0)
                             root.lift()
                             root.update_idletasks()
-                        else:
+                        elif command == "hide":
+                            self._visible = False
                             root.attributes("-alpha", 0.0)
+                        elif command == "move":
+                            self._current_x = x
+                            self._current_y = y
+                            if self._visible:
+                                root.geometry(f"{_WIDTH}x{_HEIGHT}+{x}+{y}")
+                                root.lift()
+                                root.update_idletasks()
                     finally:
                         completed.set()
                 root.after(20, process_commands)
@@ -227,3 +241,15 @@ class CursorOverlay:
     def hide_cursor(self) -> bool:
         """Make the overlay fully transparent again."""
         return self._send("hide")
+
+    def move_cursor(self, x: int, y: int) -> bool:
+        """Move the cursor to new position without hiding it (for persistent cursor)."""
+        return self._send("move", int(x), int(y))
+
+    def is_visible(self) -> bool:
+        """Check if cursor is currently visible."""
+        return self._visible
+
+    def get_position(self) -> Tuple[int, int]:
+        """Get current cursor position."""
+        return (self._current_x, self._current_y)

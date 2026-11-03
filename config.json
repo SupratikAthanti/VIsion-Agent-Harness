@@ -1,0 +1,61 @@
+{
+  "known_websites": {
+    "google": {
+      "url": "https://google.com",
+      "browser": "chrome",
+      "actions": {
+        "search": "type in search box"
+      }
+    },
+    "youtube": {
+      "url": "https://youtube.com",
+      "browser": "chrome",
+      "actions": {
+        "search": "type in search box"
+      }
+    },
+    "formula1": {
+      "url": "https://formula1.com",
+      "browser": "chrome",
+      "actions": {
+        "standings": "click Standings"
+      }
+    },
+    "github": {
+      "url": "https://github.com",
+      "browser": "chrome",
+      "actions": {}
+    },
+    "wikipedia": {
+      "url": "https://wikipedia.org",
+      "browser": "chrome",
+      "actions": {}
+    }
+  },
+  "known_apps": {
+    "vs code": {
+      "name": "code",
+      "launch_cmd": "code"
+    },
+    "terminal": {
+      "name": "gnome-terminal",
+      "launch_cmd": "gnome-terminal"
+    },
+    "firefox": {
+      "name": "firefox",
+      "launch_cmd": "firefox"
+    },
+    "chrome": {
+      "name": "google-chrome",
+      "launch_cmd": "google-chrome"
+    },
+    "files": {
+      "name": "nautilus",
+      "launch_cmd": "nautilus"
+    },
+    "calculator": {
+      "name": "gnome-calculator",
+      "launch_cmd": "gnome-calculator"
+    }
+  }
+}

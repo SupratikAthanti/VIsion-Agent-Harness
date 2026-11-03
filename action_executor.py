@@ -170,15 +170,22 @@ def click_at(x_pct: float, y_pct: float, offset_px: Tuple[int, int] = (0, 0),
     overlay = _get_cursor_overlay()
     if overlay is not None:
         try:
-            if overlay.show_cursor(x, y):
-                time.sleep(CURSOR_PREVIEW_SECONDS)
+            # Check if persistent cursor is on
+            if overlay.is_visible():
+                # Just move the cursor, don't hide it
+                overlay.move_cursor(x, y)
+            else:
+                # Brief preview mode (old behavior)
+                if overlay.show_cursor(x, y):
+                    time.sleep(CURSOR_PREVIEW_SECONDS)
         except Exception as e:
             _warn(f"cursor preview unavailable: {e}")
 
     try:
         ok = _run(["mousemove", "--sync", str(x), str(y), "click", "1"])
     finally:
-        if overlay is not None:
+        # Only hide cursor if it's not in persistent mode
+        if overlay is not None and not overlay.is_visible():
             try:
                 overlay.hide_cursor()
             except Exception as e:
